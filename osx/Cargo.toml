@@ -1,0 +1,23 @@
+[package]
+name = "emacs-osx"
+version = "0.1.0"
+authors = ["Nguyễn Tuấn Anh <ubolonton@gmail.com>"]
+publish = false
+
+[dependencies]
+libc = "0.2"
+lazy_static = "1.0"
+emacs = "0.5.1"
+cocoa = "0.14"
+
+[dependencies.objc]
+version = "0.2"
+# path = "../../rust-objc"
+features = ["exception"]
+
+# [dependencies.objc-foundation]
+# version = "0.1"
+# path = "../../rust-objc-foundation"
+
+[lib]
+crate-type = ["cdylib"]
