@@ -78,7 +78,7 @@ impl NSString {
 }
 
 /// Get and print an objects description
-unsafe fn describe(obj: *mut Object) {
+pub unsafe fn describe(obj: *mut Object) {
     let description: *mut Object = msg_send![obj, description];
     if let Some(desc_str) = to_s(description) {
         println!("Object description: {}", desc_str);
@@ -104,7 +104,7 @@ fn find_contacts(env: &CallEnv) -> Result<Value> {
     unsafe {
         let store: id = msg_send![CNContactStore, alloc];
         let store: id = msg_send![store, init];
-        describe(store);
+        // describe(store);
 
         let name = NSString0::alloc(nil).init_str(&search_str);
         let keys = NSArray::arrayWithObjects(nil, &[
