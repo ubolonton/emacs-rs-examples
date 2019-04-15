@@ -1,17 +1,17 @@
 [package]
 name = "emacs-osx"
 version = "0.1.0"
+# TODO: Set this once objc macros are 2018-compatible.
+# edition = "2018"
 authors = ["Nguyễn Tuấn Anh <ubolonton@gmail.com>"]
 publish = false
 
 [dependencies]
-libc = "0.2"
-lazy_static = "1.0"
-emacs = "0.5.1"
-cocoa = "0.14"
+emacs = "0.7.0"
+cocoa = "0.18.4"
 
 [dependencies.objc]
-version = "0.2"
+version = "0.2.6"
 # path = "../../rust-objc"
 features = ["exception"]
 

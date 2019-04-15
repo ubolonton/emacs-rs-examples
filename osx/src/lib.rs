@@ -1,35 +1,30 @@
 #![allow(non_snake_case)]
 
-extern crate libc;
-#[macro_use]
-extern crate lazy_static;
-#[macro_use]
-extern crate emacs;
 #[macro_use]
 extern crate objc;
 extern crate cocoa;
+extern crate emacs;
 
-use std::{str, slice, mem};
-use emacs::{Env, CallEnv, Result, Value, IntoLisp};
-use objc::runtime::{Object, Class};
-use objc::{Encode, Encoding};
-use cocoa::foundation::{NSString as NSString0, NSArray};
-use cocoa::foundation::NSFastEnumeration;
 use cocoa::base::{id, nil};
+use cocoa::foundation::NSFastEnumeration;
+use cocoa::foundation::{NSArray, NSString as NSString0};
+use emacs::{defun, Env, IntoLisp, Result, Value};
+use objc::runtime::{Class, Object};
+use objc::{Encode, Encoding};
+use std::{mem, slice, str};
 
-emacs_plugin_is_GPL_compatible!();
-emacs_module_init!(init);
+emacs::plugin_is_GPL_compatible!();
 
-const MODULE: &str = "osx";
-lazy_static! {
-    static ref MODULE_PREFIX: String = format!("{}/", MODULE);
+#[emacs::module(name(fn), separator = "/")]
+fn osx(_: &Env) -> Result<()> {
+    Ok(())
 }
 
 const UTF8_ENCODING: usize = 4;
 
 // /System/Library/Frameworks/Contacts.framework/Headers/CNContact.h
 #[link(name = "Contacts", kind = "framework")]
-extern {
+extern "C" {
     pub static CNContactGivenNameKey: id;
     pub static CNContactFamilyNameKey: id;
     pub static CNContactMiddleNameKey: id;
@@ -55,7 +50,7 @@ macro_rules! classes {
 
 #[derive(Debug)]
 struct NSString {
-    raw: id
+    raw: id,
 }
 
 // FIX
@@ -69,7 +64,7 @@ impl NSString {
     fn to_str(&self) -> Option<&str> {
         let raw = self.raw;
         let bytes = unsafe {
-            let length = msg_send![raw, lengthOfBytesUsingEncoding:UTF8_ENCODING];
+            let length = msg_send![raw, lengthOfBytesUsingEncoding: UTF8_ENCODING];
             let ptr: *const u8 = msg_send![raw, UTF8String];
             slice::from_raw_parts(ptr, length)
         };
@@ -88,18 +83,18 @@ pub unsafe fn describe(obj: *mut Object) {
 /// Convert an NSString to a String
 fn to_s<'a>(nsstring_obj: *mut Object) -> Option<&'a str> {
     let bytes = unsafe {
-        let length = msg_send![nsstring_obj, lengthOfBytesUsingEncoding:UTF8_ENCODING];
+        let length = msg_send![nsstring_obj, lengthOfBytesUsingEncoding: UTF8_ENCODING];
         let utf8_str: *const u8 = msg_send![nsstring_obj, UTF8String];
         slice::from_raw_parts(utf8_str, length)
     };
     str::from_utf8(bytes).ok()
 }
 
-fn find_contacts(env: &CallEnv) -> Result<Value> {
+#[defun]
+fn find_contacts(env: &Env, search_str: String) -> Result<Value> {
     classes! {
         CNContactStore, CNContact
     }
-    let search_str: String = env.parse_arg(0)?;
     let mut values: Vec<Value> = vec![];
     unsafe {
         let store: id = msg_send![CNContactStore, alloc];
@@ -107,14 +102,17 @@ fn find_contacts(env: &CallEnv) -> Result<Value> {
         // describe(store);
 
         let name = NSString0::alloc(nil).init_str(&search_str);
-        let keys = NSArray::arrayWithObjects(nil, &[
-            CNContactGivenNameKey,
-            CNContactFamilyNameKey,
-            CNContactMiddleNameKey,
-            CNContactOrganizationNameKey,
-        ]);
+        let keys = NSArray::arrayWithObjects(
+            nil,
+            &[
+                CNContactGivenNameKey,
+                CNContactFamilyNameKey,
+                CNContactMiddleNameKey,
+                CNContactOrganizationNameKey,
+            ],
+        );
         let error: *mut id = mem::uninitialized();
-        let predicate: id = msg_send![CNContact, predicateForContactsMatchingName:name];
+        let predicate: id = msg_send![CNContact, predicateForContactsMatchingName: name];
 
         let contacts: id = msg_send![store, unifiedContactsMatchingPredicate:predicate keysToFetch:keys error:error];
         for c in contacts.iter() {
@@ -134,14 +132,4 @@ fn find_contacts(env: &CallEnv) -> Result<Value> {
         msg_send![store, release];
     }
     env.list(&values)
-}
-
-fn init(env: &Env) -> Result<Value> {
-    emacs_export_functions! {
-        env, *MODULE_PREFIX, {
-            "find-contacts" => (find_contacts, 1..1),
-        }
-    }
-
-    env.provide(MODULE)
 }
