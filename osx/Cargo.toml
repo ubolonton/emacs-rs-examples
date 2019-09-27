@@ -7,7 +7,7 @@ authors = ["Nguyễn Tuấn Anh <ubolonton@gmail.com>"]
 publish = false
 
 [dependencies]
-emacs = "0.7.0"
+emacs = "0.11.0"
 cocoa = "0.18.4"
 
 [dependencies.objc]

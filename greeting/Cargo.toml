@@ -6,7 +6,7 @@ authors = ["Nguyễn Tuấn Anh <ubolonton@gmail.com>"]
 publish = false
 
 [dependencies]
-emacs = "0.7.0"
+emacs = "0.11.0"
 
 [lib]
 crate-type = ["cdylib"]

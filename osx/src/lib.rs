@@ -8,7 +8,7 @@ extern crate emacs;
 use cocoa::base::{id, nil};
 use cocoa::foundation::NSFastEnumeration;
 use cocoa::foundation::{NSArray, NSString as NSString0};
-use emacs::{defun, Env, IntoLisp, Result, Value};
+use emacs::{defun, Env, Result, Value};
 use objc::runtime::{Class, Object};
 use objc::{Encode, Encoding};
 use std::{mem, slice, str};
@@ -111,21 +111,22 @@ fn find_contacts(env: &Env, search_str: String) -> Result<Value> {
                 CNContactOrganizationNameKey,
             ],
         );
-        let error: *mut id = mem::uninitialized();
+        let error = mem::MaybeUninit::<*mut id>::uninit();
         let predicate: id = msg_send![CNContact, predicateForContactsMatchingName: name];
 
         let contacts: id = msg_send![store, unifiedContactsMatchingPredicate:predicate keysToFetch:keys error:error];
+
+        let given_name = env.intern(":given-name")?;
+        let family_name = env.intern(":family-name")?;
+        let middle_name = env.intern(":middle-name")?;
+        let organization = env.intern(":organization")?;
         for c in contacts.iter() {
-            let value = env.list(&[
-                env.intern(":given-name")?,
-                (*c).get_ivar::<NSString>("_givenName").to_str().into_lisp(env)?,
-                env.intern(":family-name")?,
-                (*c).get_ivar::<NSString>("_familyName").to_str().into_lisp(env)?,
-                env.intern(":middle-name")?,
-                (*c).get_ivar::<NSString>("_middleName").to_str().into_lisp(env)?,
-                env.intern(":organization")?,
-                (*c).get_ivar::<NSString>("_organizationName").to_str().into_lisp(env)?,
-            ])?;
+            let value = env.list((
+                given_name, (*c).get_ivar::<NSString>("_givenName").to_str(),
+                family_name, (*c).get_ivar::<NSString>("_familyName").to_str(),
+                middle_name, (*c).get_ivar::<NSString>("_middleName").to_str(),
+                organization, (*c).get_ivar::<NSString>("_organizationName").to_str(),
+            ))?;
             values.push(value);
         }
 

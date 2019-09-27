@@ -21,8 +21,6 @@ MODULE_ORIGINAL=libemacs_osx.$ext
 MODULE_RENAMED=osx.so
 `cd $MODULE_DIR && ln -f -s $MODULE_ORIGINAL $MODULE_RENAMED`
 
-EMACS=emacs
-
 RUST_BACKTRACE=0 $EMACS -batch -l ert \
               -l $MODULE_DIR/$MODULE_RENAMED \
               -l $root/src/test.el \
