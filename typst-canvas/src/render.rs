@@ -9,7 +9,10 @@ use std::{
     },
 };
 
-use typst::utils::{Scalar, hash128};
+use typst::{
+    layout::{Abs, Point},
+    utils::{Scalar, hash128},
+};
 use typst_layout::{Page, PagedDocument};
 use typst_render::RenderOptions;
 
@@ -64,7 +67,33 @@ pub struct PageImage {
     pub width: usize,
     pub height: usize,
     pub pixels: Vec<u32>,
+    /// Where the page is in the image.
+    pub page: Rect,
+    pub pixel_per_pt: f64,
     key: Key,
+}
+
+impl PageImage {
+    /// Return the page point at pixel X, Y of the image, or `None` if it is outside the page.
+    pub fn point_at(&self, x: f64, y: f64) -> Option<Point> {
+        let (x, y) = (x - self.page.x as f64, y - self.page.y as f64);
+        let inside = (0.0..=self.page.width as f64).contains(&x)
+            && (0.0..=self.page.height as f64).contains(&y);
+        inside.then(|| {
+            Point::new(
+                Abs::pt(x / self.pixel_per_pt),
+                Abs::pt(y / self.pixel_per_pt),
+            )
+        })
+    }
+
+    /// Return the pixel position of the page point POINT in the image.
+    pub fn pixel_at(&self, point: Point) -> (f64, f64) {
+        (
+            self.page.x as f64 + point.x.to_pt() * self.pixel_per_pt,
+            self.page.y as f64 + point.y.to_pt() * self.pixel_per_pt,
+        )
+    }
 }
 
 /// Render the pages of DOCUMENT for VIEW. Reuse the images in PREVIOUS that would not change, even
@@ -146,17 +175,19 @@ fn render_page(page: &Page, pixel_per_pt: f64, view: View, key: Key) -> PageImag
         width,
         height,
         pixels,
+        page,
+        pixel_per_pt,
         key,
     }
 }
 
 /// A rectangle in an image, in pixels.
 #[derive(Debug, Clone, Copy)]
-struct Rect {
-    x: usize,
-    y: usize,
-    width: usize,
-    height: usize,
+pub struct Rect {
+    pub x: usize,
+    pub y: usize,
+    pub width: usize,
+    pub height: usize,
 }
 
 impl Rect {

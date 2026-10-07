@@ -62,8 +62,16 @@ pub struct Diagnostic {
 
 pub struct Compiled {
     /// `None` if there were errors.
-    pub document: Option<PagedDocument>,
+    pub document: Option<Document>,
     pub diagnostics: Vec<Diagnostic>,
+}
+
+/// A compiled document, with the main file text that it came from. Spans in the document resolve
+/// against this text, which can be older than the world's after a failed compile.
+#[derive(Debug)]
+pub struct Document {
+    pub paged: PagedDocument,
+    pub source: Source,
 }
 
 #[derive(Debug)]
@@ -102,6 +110,11 @@ impl PreviewWorld {
         self.time = Time::system();
     }
 
+    /// Return the file system path of the file ID.
+    pub fn path(&self, id: FileId) -> Option<PathBuf> {
+        self.files.loader().resolve(id).ok()
+    }
+
     /// Set the default colors. Return true if they changed, and so the document must be compiled
     /// again.
     ///
@@ -119,7 +132,13 @@ impl PreviewWorld {
     pub fn compile(&self) -> Compiled {
         let Warned { output, warnings } = typst::compile::<PagedDocument>(self);
         let (document, errors) = match output {
-            Ok(document) => (Some(document), Default::default()),
+            Ok(paged) => (
+                Some(Document {
+                    paged,
+                    source: self.main.clone(),
+                }),
+                Default::default(),
+            ),
             Err(errors) => (None, errors),
         };
         let diagnostics = errors
@@ -266,7 +285,9 @@ mod tests {
         let compiled = world("A\n#pagebreak()\nB").compile();
         assert_eq!(compiled.diagnostics, []);
         assert_eq!(
-            compiled.document.map(|document| document.pages().len()),
+            compiled
+                .document
+                .map(|document| document.paged.pages().len()),
             Some(2)
         );
     }
@@ -321,7 +342,7 @@ mod tests {
         let Some(document) = compiled.document else {
             panic!("{:?}", compiled.diagnostics);
         };
-        let page = &document.pages()[0];
+        let page = &document.paged.pages()[0];
         assert_eq!(
             page.fill,
             Smart::Custom(Some(Color::from_u8(0x10, 0x20, 0x30, 0xFF).into()))
@@ -331,7 +352,7 @@ mod tests {
         assert_eq!(
             compiled
                 .document
-                .map(|document| document.pages()[0].fill.clone()),
+                .map(|document| document.paged.pages()[0].fill.clone()),
             Some(Smart::Auto)
         );
     }

@@ -14,6 +14,7 @@
 (require 'cl-lib)
 (require 'color)
 (require 'flymake)
+(require 'pulse)
 (require 'typst-canvas-dyn)
 
 (defgroup typst-canvas nil
@@ -296,13 +297,17 @@ DIAGNOSTIC is an element of `typst-canvas--session-diagnostics'."
   "0" #'typst-canvas-zoom-fit
   "n" #'typst-canvas-next-page
   "p" #'typst-canvas-previous-page
-  "t" #'typst-canvas-toggle-theme)
+  "t" #'typst-canvas-toggle-theme
+  "RET" #'typst-canvas-jump-at-point
+  "<mouse-1>" #'typst-canvas-mouse-jump)
 
 (define-derived-mode typst-canvas-preview-mode special-mode "Typst-Canvas"
   "Major mode for the preview of a Typst buffer.
 Each page is one canvas image on its own line."
   (setq truncate-lines t)
   (setq cursor-type nil)
+  ;; Scrolling to a point in a page leaves point on a line that can be partly visible.
+  (setq-local make-cursor-line-fully-visible nil)
   (setq header-line-format '(:eval (typst-canvas--header-line)))
   (setq-local revert-buffer-function #'typst-canvas--revert)
   (add-hook 'window-size-change-functions #'typst-canvas--on-resize nil t)
@@ -319,7 +324,7 @@ Each page is one canvas image on its own line."
   "Show COUNT pages of SESSION.  Copy only pages whose image changed."
   (typst-canvas--set-page-count count)
   (dotimes (index count)
-    (pcase-let ((`(,serial ,width ,height) (typst-canvas--page-info session index))
+    (pcase-let ((`(,serial ,width ,height . ,_) (typst-canvas--page-info session index))
                 (canvas (aref typst-canvas--canvases index)))
       (unless (or (null serial) (eql serial (aref typst-canvas--serials index)))
         ;; A canvas spec is a plist after `image'.  `plist-put' changes existing keys in place,
@@ -347,7 +352,8 @@ Each page is one canvas image on its own line."
           (goto-char (point-max))
           (cl-loop for canvas in new
                    for index from old
-                   do (insert (propertize " " 'display canvas 'typst-canvas-page index) "\n")))
+                   do (insert (propertize " " 'display canvas 'typst-canvas-page index 'pointer 'hand)
+                              "\n")))
         (setq typst-canvas--canvases (vconcat typst-canvas--canvases new))
         (setq typst-canvas--serials (vconcat typst-canvas--serials (make-vector (- count old) nil)))))
      ((< count old)
@@ -445,6 +451,101 @@ See `typst-canvas-match-theme'."
   (setq-local typst-canvas-match-theme (not typst-canvas-match-theme))
   (typst-canvas--request-view)
   (message "Theme colors %s" (if typst-canvas-match-theme "on" "off")))
+
+;;;; Backward sync: from a page to the source
+
+(defconst typst-canvas--scroll-fraction (/ 1.0 3)
+  "Scrolling puts its target this fraction of the window height from the top.")
+
+(defconst typst-canvas--jump-at-point-columns '(0.5 0.4 0.6 0.3 0.7 0.2 0.8)
+  "Where `typst-canvas-jump-at-point' tries a page, as fractions of its width.
+The middle of a line can be a space between words, which leads nowhere.")
+
+(defun typst-canvas-mouse-jump (event)
+  "Jump to the source of what EVENT clicked on a page."
+  (interactive "e" typst-canvas-preview-mode)
+  (let* ((position (event-start event))
+         (buffer (window-buffer (posn-window position)))
+         (xy (posn-object-x-y position))
+         (page (and (posn-point position)
+                    (get-text-property (posn-point position) 'typst-canvas-page buffer))))
+    (when (and page xy)
+      (with-current-buffer buffer
+        (typst-canvas--jump page (car xy) (cdr xy))))))
+
+(defun typst-canvas-jump-at-point ()
+  "Jump to the source of the middle of the visible part of the page at point."
+  (interactive nil typst-canvas-preview-mode)
+  (let ((page (get-text-property (point) 'typst-canvas-page)))
+    (unless page
+      (user-error "No page at point"))
+    (let* ((canvas (aref typst-canvas--canvases page))
+           (width (image-property canvas :data-width))
+           (height (image-property canvas :data-height))
+           ;; (X Y RTOP RBOT ...): RTOP and RBOT are the hidden pixels at the top and bottom.
+           (visible (cddr (pos-visible-in-window-p (point) nil t)))
+           (y (/ (+ (or (nth 0 visible) 0) (- height (or (nth 1 visible) 0))) 2)))
+      (unless (cl-some (lambda (fraction) (typst-canvas--jump page (round (* fraction width)) y t))
+                       typst-canvas--jump-at-point-columns)
+        (message "Nothing to jump to here")))))
+
+(defun typst-canvas--jump (page x y &optional quiet)
+  "Jump to the source of pixel X, Y of PAGE.  Return non-nil if there was one.
+If QUIET is nil, say when there was none."
+  (let ((session (buffer-local-value 'typst-canvas--session typst-canvas--source)))
+    (pcase (and session (typst-canvas--session-jump session page x y))
+      (`(source ,position)
+       (typst-canvas--show-source position)
+       t)
+      (`(file ,path ,position)
+       (find-file-other-window path)
+       (goto-char (min position (point-max)))
+       (typst-canvas--pulse)
+       t)
+      (`(url ,url)
+       (browse-url url)
+       t)
+      (`(position ,target ,target-y)
+       (when-let* ((window (get-buffer-window (current-buffer) t)))
+         (typst-canvas--scroll-to window target target-y))
+       t)
+      (_
+       (unless quiet
+         (message "Nothing to jump to here"))
+       nil))))
+
+(defun typst-canvas--show-source (position)
+  "Select a window with the source buffer, go to POSITION, and pulse it."
+  (let ((source typst-canvas--source))
+    (select-window (or (get-buffer-window source) (display-buffer source)))
+    (goto-char (min position (point-max)))
+    (typst-canvas--pulse)))
+
+(defun typst-canvas--pulse ()
+  "Briefly highlight the word at point, or the line if there is no word."
+  (pcase-let ((`(,beg . ,end) (or (bounds-of-thing-at-point 'word)
+                                  (cons (line-beginning-position) (line-end-position)))))
+    (pulse-momentary-highlight-region beg end)))
+
+(defun typst-canvas--page-height (index)
+  "Return the pixel height of the line of page INDEX."
+  (image-property (aref typst-canvas--canvases index) :data-height))
+
+(defun typst-canvas--scroll-to (window page y)
+  "Scroll WINDOW so that pixel row Y of PAGE is near its top.
+See `typst-canvas--scroll-fraction'."
+  (let* ((target (- (+ (cl-loop for index below page sum (typst-canvas--page-height index)) y)
+                    (round (* typst-canvas--scroll-fraction (window-body-height window t)))))
+         (index 0)
+         (top 0))
+    ;; Find the page line that contains TARGET, and the pixels of it above TARGET.
+    (while (and (< (1+ index) (length typst-canvas--canvases))
+                (<= (+ top (typst-canvas--page-height index)) target))
+      (cl-incf top (typst-canvas--page-height index))
+      (cl-incf index))
+    (set-window-start window (typst-canvas--page-position index))
+    (set-window-point window (typst-canvas--page-position page))
+    (set-window-vscroll window (max 0 (- target top)) t)))
 
 (defun typst-canvas--current-page ()
   "Return the index of the page at point."

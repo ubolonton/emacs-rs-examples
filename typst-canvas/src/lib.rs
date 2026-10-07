@@ -7,6 +7,7 @@
 mod offset;
 mod render;
 mod session;
+mod sync;
 mod world;
 
 use std::path::Path;
@@ -17,6 +18,7 @@ use typst::diag::Severity;
 use crate::{
     render::View,
     session::{Request, Session},
+    sync::Target,
     world::{PreviewWorld, Theme},
 };
 
@@ -116,15 +118,63 @@ fn session_diagnostics<'e>(env: &'e Env, session: &Session) -> Result<Value<'e>>
     env.list(&diagnostics)
 }
 
-/// Return (SERIAL WIDTH HEIGHT) of the image of page INDEX (0-based) of SESSION, or nil.
-/// SERIAL changes when the image changes.
+/// Return where a click at pixel X, Y of the image of page INDEX (0-based) of SESSION leads:
+/// - (source POS): position POS in the main file, in the text of the last good compile.
+/// - (file PATH POS): position POS in another file.
+/// - (url URL).
+/// - (position PAGE Y): pixel row Y of the image of page PAGE, e.g. for an internal link.
+///
+/// Return nil if the click hits no text, shape, image or link.
+#[defun]
+fn session_jump<'e>(
+    env: &'e Env,
+    session: &Session,
+    index: usize,
+    x: i64,
+    y: i64,
+) -> Result<Option<Value<'e>>> {
+    // Aim at the pixel center.
+    let (x, y) = (x as f64 + 0.5, y as f64 + 0.5);
+    let Some(target) = session.jump(index, x, y) else {
+        return Ok(None);
+    };
+    let value = match target {
+        Target::Main(char) => env.list((env.intern("source")?, char + 1))?,
+        Target::File(path, char) => env.list((
+            env.intern("file")?,
+            path.to_string_lossy().as_ref(),
+            char + 1,
+        ))?,
+        Target::Url(url) => env.list((env.intern("url")?, url))?,
+        Target::Position(page, point) => {
+            let Some(y) = session.pixel_y(page, point) else {
+                return Ok(None);
+            };
+            env.list((env.intern("position")?, page, y))?
+        }
+    };
+    Ok(Some(value))
+}
+
+/// Return (SERIAL WIDTH HEIGHT PAGE-X PAGE-Y SCALE) of the image of page INDEX (0-based) of
+/// SESSION, or nil. SERIAL changes when the image changes. PAGE-X and PAGE-Y are the pixel
+/// position of the page in the image. SCALE is in pixels per typographic point.
 #[defun]
 fn page_info<'e>(env: &'e Env, session: &Session, index: usize) -> Result<Option<Value<'e>>> {
     let output = session.output();
     output
         .pages
         .get(index)
-        .map(|image| env.list((image.serial, image.width, image.height)))
+        .map(|image| {
+            env.list((
+                image.serial,
+                image.width,
+                image.height,
+                image.page.x,
+                image.page.y,
+                image.pixel_per_pt,
+            ))
+        })
         .transpose()
 }
 

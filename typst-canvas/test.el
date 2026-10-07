@@ -49,7 +49,7 @@ Return the status."
 
 (defun typst-canvas-test--canvas-for (session index)
   "Return a new canvas with the size of page INDEX of SESSION."
-  (pcase-let ((`(,_serial ,width ,height) (typst-canvas--page-info session index)))
+  (pcase-let ((`(,_serial ,width ,height . ,_) (typst-canvas--page-info session index)))
     (list 'image :type 'canvas :id (make-symbol "typst-canvas-test")
           :data-width width :data-height height)))
 
@@ -220,6 +220,70 @@ Return the status."
       (with-current-buffer typst-buffer
         (should-not typst-canvas-mode)
         (should-not typst-canvas--session)))))
+
+;;;; Backward sync
+
+(defconst typst-canvas-test--jump-page
+  "#set page(width: 100pt, height: 100pt, margin: 10pt)\n"
+  "Page setup whose first text line is at a known place.")
+
+(defun typst-canvas-test--pixel (session page x y)
+  "Return the pixel (X . Y) of the page point X, Y (in points) of PAGE of SESSION."
+  (pcase-let ((`(,_serial ,_width ,_height ,page-x ,page-y ,scale)
+               (typst-canvas--page-info session page)))
+    (cons (floor (+ page-x (* x scale))) (floor (+ page-y (* y scale))))))
+
+(ert-deftest typst-canvas::session-jump-finds-targets ()
+  (typst-canvas-test--call-with-session
+   (lambda (session _)
+     (let ((text (concat typst-canvas-test--jump-page
+                         "é Hello\n\n#link(\"https://typst.app\")[Web]")))
+       (typst-canvas-test--serve session text)
+       (pcase-let ((`(,x . ,y) (typst-canvas-test--pixel session 0 10.5 15)))
+         (should (equal (typst-canvas--session-jump session 0 x y)
+                        (list 'source (1+ (string-search "é" text))))))
+       ;; The margin leads nowhere.
+       (should-not (typst-canvas--session-jump session 0 1 1))
+       (pcase-let ((`(,x . ,y) (typst-canvas-test--pixel session 0 11 30)))
+         (should (equal (typst-canvas--session-jump session 0 x y)
+                        '(url "https://typst.app"))))))))
+
+(ert-deftest typst-canvas::click-jumps-to-source ()
+  (let* ((temporary-file-directory (expand-file-name "target/" typst-canvas-test--root))
+         (_ (make-directory temporary-file-directory t))
+         (file (make-temp-file "typst-canvas-test" nil ".typ"
+                               (concat typst-canvas-test--jump-page
+                                       "Hello world\n#place(horizon + center)[Middle]")))
+         (buffer (find-file-noselect file)))
+    (unwind-protect
+        (with-current-buffer buffer
+          (typst-canvas-mode 1)
+          (goto-char (point-min))
+          (let ((preview typst-canvas--preview)
+                (session typst-canvas--session))
+            (with-current-buffer preview
+              (typst-canvas-test--wait
+               (lambda () (and (= (length typst-canvas--serials) 1)
+                               (aref typst-canvas--serials 0))))
+              (should-not (typst-canvas--jump 0 1 1 'quiet))
+              ;; A jump selects the source, so do it last here.
+              (pcase-let ((`(,x . ,y) (typst-canvas-test--pixel session 0 11 15)))
+                (should (typst-canvas--jump 0 x y))))
+            ;; The jump selected the source, and moved point to the clicked word.
+            (should (eq (current-buffer) buffer))
+            (should (eq (window-buffer (selected-window)) buffer))
+            (should (equal (thing-at-point 'word) "Hello"))
+            ;; RET tries the middle of the visible part of the page.
+            (goto-char (point-min))
+            (with-current-buffer preview
+              (goto-char (typst-canvas--page-position 0))
+              (typst-canvas-jump-at-point))
+            (should (equal (thing-at-point 'word) "Middle"))
+            (typst-canvas-mode -1)))
+      (with-current-buffer buffer
+        (set-buffer-modified-p nil))
+      (kill-buffer buffer)
+      (delete-file file))))
 
 ;;;; Theme
 

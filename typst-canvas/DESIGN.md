@@ -15,7 +15,7 @@ Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates:
 | Pages | One canvas per page, stacked in a preview buffer. Only pages whose frame hash changed are re-rendered and re-copied. |
 | Zoom | Default: fit page width to the preview window body. `+`/`-`/`0` zoom; window resize re-renders. |
 | Errors | Diagnostics go to Flymake in the source buffer. The preview keeps the last good render and shows the error count in its header line. |
-| Backward sync | `mouse-1` on a page: `typst_ide::jump_from_click` → move point in the source window and pulse the region. Links open with `browse-url`; internal links scroll the preview. |
+| Backward sync | `mouse-1` on a page (hand pointer), or `RET` (the middle row of the visible part of the page at point, at several columns until one hits): `typst_ide::jump_from_click` → select the source window, go to the char, pulse the word (or the line). Other files open with `find-file-other-window`. Links open with `browse-url`; internal links scroll the preview. |
 | Forward sync | Point movement in the source (debounced): `typst_ide::jump_from_cursor` → draw a caret + line highlight in the page pixels, scroll the preview to keep it visible. |
 | Theme | `typst-canvas-match-theme` (default on): page fill = `default` face background, text fill = foreground, set via `Library` styles (no source rewriting, so spans stay valid). Line and table strokes get the text color too; other default strokes stay black. Toggle with `t` (buffer-local in the preview). `enable-theme-functions`/`disable-theme-functions` re-apply it while a session exists. |
 | Look | Each canvas = page + margin in the desk color + 1-pixel border + soft drop shadow, drawn in Rust. Border and shadow get stronger on a dark desk (white-ish border, more opaque shadow). The canvas is at least as wide as the window, with the page centered. Desk color: `default` face background with its HSL lightness shifted 8% (darker if light, lighter if dark), so that pages stand out also when they match the theme. Hex colors are parsed without a frame (`color-values-from-color-spec`), because a text terminal frame rounds them. |
@@ -29,11 +29,12 @@ Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates:
   - Other files: `typst_kit::files::FileStore<SystemFiles>`, reset before each compile so disk changes show.
   - Fonts: `typst-kit` font search (system + embedded), loaded once per process (`LazyLock`), on first use (a compile thread).
   - Packages: `typst_kit::packages::SystemPackages` with `SystemDownloader` (Typst Universe download into the cache dir).
+  - `compile` returns a `Document`: the `PagedDocument` and the main `Source` it came from. After a failed compile, the world has newer text than the last good document, so jumps resolve spans against the document's `Source`.
   - Diagnostics: converted to char ranges in the main file. A diagnostic in another file goes to the innermost main-file call site in its trace, with the file name in the message.
 - `session.rs`: `Session`, owned by Lisp as a `user-ptr`. Drop stops and joins the thread.
   - All shared state is in one `Arc<Shared>`: request slot, world, output.
   - Request slot: `Mutex<Slot>` + `Condvar`. A request carries the new text (optional), the theme colors (optional), and the view (fit width px, zoom, desk color). A theme change compiles again, also without new text. A new request replaces an unserved one, but keeps its text if it has none. Each request gets an ID.
-  - World: `Mutex<PreviewWorld>`; the thread locks it for update + compile. Phase 2: the Lisp thread locks it briefly for jumps.
+  - World: `Mutex<PreviewWorld>`; the thread locks it for update + compile. A click jump locks it on the Lisp thread (for other files), so it waits for a running compile.
   - Output: `Mutex<Output>` with the ID of the newest served request (Lisp compares it with the newest sent ID to show "compiling"), the last good document (`Arc`), rendered pages (`Arc<PageImage>`), diagnostics, compile ms, render ms.
   - Notify: after each served request, the thread writes `"\n"` to the pipe. Write errors are ignored.
   - A panic in Typst becomes an error diagnostic. The thread continues.
@@ -41,7 +42,7 @@ Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates:
   - Each `PageImage` has a key (page hash via `typst::utils::hash128(&Page)`, scale, window width, desk color) and a serial. A re-render reuses images with the same key, also if their page moved. Lisp copies a page only if its serial changed.
   - Scale: the widest page fits the window width minus margins, times the zoom. A pixel budget per page caps it.
 - `offset.rs`: UTF-8 byte ↔ Emacs char offset conversion.
-- `sync.rs` (Phase 2): click/cursor jumps.
+- `sync.rs`: click jumps (`jump_from_click` with a `Snapshot` world whose main file is the document's `Source`); cursor jumps (Phase 2).
 
 Invariant: only defuns (Lisp thread) touch canvas memory, and only inside `with_canvas_data`. The
 thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, never panic.
@@ -52,7 +53,7 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
   - Changes schedule a zero-delay timer that sends the whole text once per command.
   - Teardown stops the session before it deletes the pipe process: in batch mode, Emacs does not ignore `SIGPIPE`.
   - Flymake: the backend stores the newest report function, and reports when diagnostics change. It has `flymake-always-safe`, because the user started the compile with the mode, not Flymake.
-- `typst-canvas-preview-mode`: `special-mode` for `*typst-canvas: NAME*`. Keys: `+ - 0 t g q`, `n`/`p` pages. Phase 2: `mouse-1` jump.
+- `typst-canvas-preview-mode`: `special-mode` for `*typst-canvas: NAME*`. Keys: `+ - 0 t g q`, `n`/`p` pages, `mouse-1`/`RET` jump.
   - `window-size-change-functions` re-renders when the window body width changes.
 - Each page is one line: an image char with a `typst-canvas-page` text property (0-based index), and a newline. Page lines are added or removed at the end.
 - Canvas specs get an uninterned `:id`: Emacs finds canvases by `eq` spec, but its image cache matches specs by `equal`. Resize: `plist-put` of `:data-width`/`:data-height` on the same spec.
@@ -70,14 +71,14 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
 3. Showcase: demo document, self-typing demo command, screencast (GIF), README.
 4. Review: code review pass, fixes, docs.
 
-## Typst 0.15 API notes for Phase 2
+## Typst 0.15 API notes
 
 - `typst_ide::jump_from_click(world: &dyn IdeWorld, document: &PagedDocument, position: &PagedPosition) -> Option<Jump>`.
   `PagedPosition { page: NonZeroUsize /* 1-based */, point: Point /* pt, from the page's top left */ }`.
   `Jump::File(FileId, usize /* byte offset */) | Jump::Url(Url) | Jump::Position(PagedPosition)`.
-  Pixel → point: `(x - page_x) / pixel_per_pt` (store `page_x`, `page_y`, `pixel_per_pt` in `PageImage`).
+  Pixel → point: `(x - page.x) / pixel_per_pt`. `PageImage` stores `page` (its `Rect` in the image) and `pixel_per_pt`.
 - `typst_ide::jump_from_cursor(document: &PagedDocument, source: &Source, cursor: usize /* byte */) -> Vec<PagedPosition>`.
   Only `Text`/`MathText` leaves match. The point is the start of the first glyph with that span, on the text baseline (the glyph box is `y - size .. y`).
-- Both resolve spans against the world's current sources. After a failed compile, the last good document has spans of older text, so a jump can miss or be wrong.
+- Both resolve spans against sources. After a failed compile, the world's main source is newer than the last good document's spans, so jumps use the document's own `Source`.
 - Theme: `library.styles.set(PageElem::fill, Smart::Custom(Some(color.into())))` and `library.styles.set(TextElem::fill, color.into())`, with `Color::from_u8(r, g, b, 255)`. Set them on `Library::default()`, then replace `PreviewWorld::library` (`LazyHash::new`). See `typst-ide/src/tests.rs`.
 - Frames hash cheaply: `Frame` items are an `Arc<LazyHash<..>>`, so `hash128(&page)` reuses cached item hashes.

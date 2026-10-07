@@ -12,12 +12,12 @@ use std::{
     time::Instant,
 };
 
-use typst::diag::Severity;
-use typst_layout::PagedDocument;
+use typst::{diag::Severity, layout::Point};
 
 use crate::{
     render::{self, PageImage, View},
-    world::{Compiled, Diagnostic, PreviewWorld, Theme},
+    sync::{self, Target},
+    world::{Compiled, Diagnostic, Document, PreviewWorld, Theme},
 };
 
 /// Memoized results unused for this many compiles are evicted. Same as `typst watch`.
@@ -40,7 +40,7 @@ pub struct Output {
     /// ID of the newest request that this output reflects. 0 before the first one.
     pub served: u64,
     /// The last document that compiled without errors. Errors keep the previous one.
-    pub document: Option<Arc<PagedDocument>>,
+    pub document: Option<Arc<Document>>,
     /// Images of the pages of `document`.
     pub pages: Vec<Arc<PageImage>>,
     /// Diagnostics of the newest compile, also if it failed.
@@ -117,6 +117,24 @@ impl Session {
 
     pub fn output(&self) -> MutexGuard<'_, Output> {
         lock(&self.shared.output)
+    }
+
+    /// Return where a click at pixel X, Y of the image of page INDEX leads.
+    ///
+    /// Waits for the current compile, because it needs the world.
+    pub fn jump(&self, index: usize, x: f64, y: f64) -> Option<Target> {
+        let (document, image) = {
+            let output = self.output();
+            (output.document.clone()?, output.pages.get(index).cloned()?)
+        };
+        let point = image.point_at(x, y)?;
+        sync::jump(&lock(&self.shared.world), &document, index, point)
+    }
+
+    /// Return the pixel row of the page point POINT in the image of page INDEX.
+    pub fn pixel_y(&self, index: usize, point: Point) -> Option<f64> {
+        let output = self.output();
+        Some(output.pages.get(index)?.pixel_at(point).1)
     }
 
     /// Stop the thread. Wait for it to finish the current request.
@@ -203,7 +221,7 @@ impl Shared {
         let start = Instant::now();
         let pages = document
             .as_ref()
-            .map(|document| render::render_pages(document, request.view, &previous));
+            .map(|document| render::render_pages(&document.paged, request.view, &previous));
         let render_ms = elapsed_ms(start);
 
         let mut output = lock(&self.output);
