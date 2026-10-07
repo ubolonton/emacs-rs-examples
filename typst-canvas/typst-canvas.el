@@ -404,25 +404,43 @@ Each page is one canvas image on its own line."
       (list typst-canvas--sent typst-canvas--status))))
 
 (defun typst-canvas--header-line ()
-  "Return the header line of the preview: status, pages, times, zoom."
+  "Return the header line of the preview: status, page, times, zoom."
   (pcase-let* ((`(,sent ,status) (typst-canvas--source-status))
                (`(,served ,pages ,errors ,warnings ,compile-ms ,render-ms) status)
                (state (cond
-                       ((null served) "stopped")
-                       ((< served sent) "compiling")
+                       ((null served) (propertize "stopped" 'face 'shadow))
+                       ((< served sent) (propertize "compiling" 'face 'shadow))
                        ((> errors 0)
-                        (propertize (format "%d error%s" errors (if (= errors 1) "" "s"))
-                                    'face 'error))
+                        (concat (propertize (typst-canvas--count errors "error") 'face 'error)
+                                ;; The pages are from the last good compile.
+                                (when (> pages 0)
+                                  (concat " " (propertize "stale" 'face 'warning)))))
                        ((> warnings 0)
-                        (propertize (format "%d warning%s" warnings (if (= warnings 1) "" "s"))
-                                    'face 'warning))
-                       (t "ok"))))
-    (concat " " state
-            (when served
-              (format "  %d page%s  compile %d ms  render %d ms"
-                      pages (if (= pages 1) "" "s") (round compile-ms) (round render-ms)))
-            ;; "%%%%" makes "%%", which the header line shows as "%".
-            (format "  %d%%%%" (round (* 100 typst-canvas--zoom))))))
+                        (propertize (typst-canvas--count warnings "warning") 'face 'warning))
+                       (t (propertize "ok" 'face 'success)))))
+    (concat " "
+            (string-join
+             (delq nil
+                   (list state
+                         (when (and served (> pages 0))
+                           (format "p %d/%d" (1+ (min (typst-canvas--shown-page) (1- pages)))
+                                   pages))
+                         (when served
+                           (propertize (format "compile %d ms" (round compile-ms)) 'face 'shadow))
+                         (when served
+                           (propertize (format "render %d ms" (round render-ms)) 'face 'shadow))
+                         ;; "%%%%" makes "%%", which the header line shows as "%".
+                         (format "%d%%%%" (round (* 100 typst-canvas--zoom)))))
+             (propertize " · " 'face 'shadow)))))
+
+(defun typst-canvas--count (count noun)
+  "Return COUNT and NOUN, e.g. \"1 error\" or \"2 errors\"."
+  (format "%d %s%s" count noun (if (= count 1) "" "s")))
+
+(defun typst-canvas--shown-page ()
+  "Return the page of the caret, or else the top page of the selected window."
+  (or typst-canvas--caret-page
+      (/ (- (window-start) (point-min)) 2)))
 
 (defun typst-canvas--request-view ()
   "Ask the session of this preview to re-render for the current window and zoom."

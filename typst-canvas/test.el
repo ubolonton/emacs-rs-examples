@@ -183,7 +183,9 @@ Return the status."
               ;; `format-mode-line' returns "" in batch mode, so check the construct.  The
               ;; header line shows "%%" as "%".
               (let ((header (typst-canvas--header-line)))
-                (should (string-search "2 pages" header))
+                (should (string-search "ok" header))
+                (should (eq (get-text-property 1 'face header) 'success))
+                (should (string-search "p 1/2" header))
                 (should (string-search "100%%" header))))
             ;; An error goes to Flymake, and the preview keeps the last good pages.
             (goto-char (point-max))
@@ -195,7 +197,9 @@ Return the status."
                            "nope"))
             (with-current-buffer preview
               (should (= (length typst-canvas--canvases) 2))
-              (should (string-search "1 error" (typst-canvas--header-line))))
+              (let ((header (typst-canvas--header-line)))
+                (should (string-search "1 error stale" header))
+                (should (eq (get-text-property 1 'face header) 'error))))
             ;; A third page adds a line.
             (delete-region (- (point-max) 6) (point-max))
             (insert "\n#pagebreak()\nC")
@@ -329,6 +333,8 @@ Return the status."
           (run-hooks 'post-command-hook)
           (typst-canvas-test--wait
            (lambda () (eql (buffer-local-value 'typst-canvas--caret-page preview) 1)))
+          (with-current-buffer preview
+            (should (string-search "p 2/2" (typst-canvas--header-line))))
           ;; In code, the caret disappears.
           (search-backward "pagebreak")
           (run-hooks 'post-command-hook)
