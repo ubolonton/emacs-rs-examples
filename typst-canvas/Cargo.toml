@@ -1,0 +1,30 @@
+[package]
+name = "typst-canvas"
+version = "0.1.0"
+edition = "2024"
+authors = ["Nguyễn Tuấn Anh <ubolonton@gmail.com>"]
+publish = false
+
+[dependencies]
+# TODO: Use a crates.io version once `emacs-32-experimental` is released. Until then, this needs a
+# checkout of emacs-module-rs with the canvas binding next to this repo.
+emacs = { path = "../../emacs-module-rs", features = ["emacs-32-experimental"] }
+typst = "0.15"
+typst-layout = "0.15"
+typst-render = "0.15"
+typst-ide = "0.15"
+typst-kit = { version = "0.15", features = [
+    "datetime",
+    "embedded-fonts",
+    "scan-fonts",
+    "system-downloader",
+    "system-files",
+] }
+
+[lib]
+crate-type = ["cdylib"]
+
+# Typst is too slow for live use without optimizations. Optimize dependencies, but keep this crate
+# fast to rebuild.
+[profile.dev.package."*"]
+opt-level = 2
