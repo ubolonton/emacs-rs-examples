@@ -6,6 +6,8 @@
 
 use std::{
     io::{self, Write},
+    mem,
+    ops::Range,
     panic::{self, AssertUnwindSafe},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
     thread::{self, JoinHandle},
@@ -15,8 +17,9 @@ use std::{
 use typst::{diag::Severity, layout::Point};
 
 use crate::{
+    offset,
     render::{self, PageImage, View},
-    sync::{self, Target},
+    sync::{self, Caret, Target},
     world::{Compiled, Diagnostic, Document, PreviewWorld, Theme},
 };
 
@@ -78,6 +81,16 @@ struct Shared {
 pub struct Session {
     shared: Arc<Shared>,
     thread: Option<JoinHandle<()>>,
+    /// The caret and its color (`0xRRGGBB`). Only the Lisp thread uses it, to draw onto canvases.
+    caret: Mutex<Option<(Caret, u32)>>,
+}
+
+/// Where the caret is on its page image.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CaretPlace {
+    pub page: usize,
+    /// Pixel rows of the caret's line band.
+    pub rows: Range<usize>,
 }
 
 impl Session {
@@ -99,6 +112,7 @@ impl Session {
         Ok(Self {
             shared,
             thread: Some(thread),
+            caret: Mutex::default(),
         })
     }
 
@@ -129,6 +143,39 @@ impl Session {
         };
         let point = image.point_at(x, y)?;
         sync::jump(&lock(&self.shared.world), &document, index, point)
+    }
+
+    /// Move the caret to char offset CURSOR of the main file, or hide it if CURSOR is `None` or not
+    /// in laid-out text. COLOR is the bar color, as `0xRRGGBB`. Return the page of the previous
+    /// caret, and the place of the new one.
+    ///
+    /// The offset is in the text of the last good compile.
+    pub fn set_caret(
+        &self,
+        cursor: Option<usize>,
+        color: u32,
+    ) -> (Option<usize>, Option<CaretPlace>) {
+        let output = self.output();
+        let caret = cursor
+            .zip(output.document.as_ref())
+            .and_then(|(cursor, document)| {
+                let byte = offset::char_to_byte(document.source.text(), cursor);
+                sync::caret(document, byte)
+            });
+        let place = caret.and_then(|caret| {
+            let image = output.pages.get(caret.page)?;
+            Some(CaretPlace {
+                page: caret.page,
+                rows: render::caret_band(image, &caret),
+            })
+        });
+        let previous = mem::replace(&mut *lock(&self.caret), caret.map(|caret| (caret, color)));
+        (previous.map(|(caret, _)| caret.page), place)
+    }
+
+    /// Return the caret and its color, if it is on page INDEX.
+    pub fn caret_on(&self, index: usize) -> Option<(Caret, u32)> {
+        lock(&self.caret).filter(|(caret, _)| caret.page == index)
     }
 
     /// Return the pixel row of the page point POINT in the image of page INDEX.

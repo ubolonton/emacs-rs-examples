@@ -7,6 +7,13 @@ pub fn byte_to_char(text: &str, byte: usize) -> usize {
     text[..floor_char_boundary(text, byte)].chars().count()
 }
 
+/// Return the byte offset of char offset CHAR in TEXT, clamped to the end of TEXT.
+pub fn char_to_byte(text: &str, char: usize) -> usize {
+    text.char_indices()
+        .nth(char)
+        .map_or(text.len(), |(byte, _)| byte)
+}
+
 fn floor_char_boundary(text: &str, byte: usize) -> usize {
     let mut byte = byte.min(text.len());
     while !text.is_char_boundary(byte) {
@@ -27,6 +34,18 @@ mod tests {
         assert_eq!(byte_to_char(text, 3), 2);
         assert_eq!(byte_to_char(text, 7), 3);
         assert_eq!(byte_to_char(text, 8), 4);
+    }
+
+    #[test]
+    fn converts_chars_to_bytes() {
+        let text = "aé😀b";
+        assert_eq!(char_to_byte(text, 0), 0);
+        assert_eq!(char_to_byte(text, 2), 3);
+        assert_eq!(char_to_byte(text, 3), 7);
+        for char in 0..=4 {
+            assert_eq!(byte_to_char(text, char_to_byte(text, char)), char);
+        }
+        assert_eq!(char_to_byte(text, 100), text.len());
     }
 
     #[test]

@@ -3,6 +3,7 @@
 
 use std::{
     collections::HashMap,
+    ops::Range,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -15,6 +16,8 @@ use typst::{
 };
 use typst_layout::{Page, PagedDocument};
 use typst_render::RenderOptions;
+
+use crate::sync::Caret;
 
 /// Space around each page, in pixels. It holds the border and the shadow.
 pub const MARGIN: u32 = 16;
@@ -32,6 +35,15 @@ const LIGHT_DESK_SHADOW: f64 = 0.35;
 const DARK_DESK_SHADOW: f64 = 0.6;
 /// Opacity of the border color (black on a light desk, white on a dark one) over the desk.
 const BORDER_OPACITY: f64 = 0.2;
+/// Height of the caret bar above and below the baseline, as fractions of the font size.
+const CARET_ASCENT: f64 = 0.8;
+const CARET_DESCENT: f64 = 0.2;
+/// Width of the caret bar: a fraction of the font size, but at least `MIN_CARET_WIDTH` pixels.
+const CARET_WIDTH: f64 = 0.08;
+const MIN_CARET_WIDTH: f64 = 2.0;
+/// The line band is the caret bar's rows plus this fraction of the font size on each side.
+const BAND_PADDING: f64 = 0.15;
+const BAND_OPACITY: f64 = 0.1;
 /// The largest page image, in pixels. Bounds memory use at high zoom.
 const MAX_PAGE_PIXELS: f64 = 16_000_000.0;
 const MIN_PIXEL_PER_PT: f64 = 0.05;
@@ -181,6 +193,46 @@ fn render_page(page: &Page, pixel_per_pt: f64, view: View, key: Key) -> PageImag
     }
 }
 
+/// Return the pixel rows of the line band of CARET in IMAGE.
+pub fn caret_band(image: &PageImage, caret: &Caret) -> Range<usize> {
+    let (_, baseline) = image.pixel_at(caret.point);
+    let size = caret.size.to_pt() * image.pixel_per_pt;
+    let page_rows = image.page.y..image.page.y + image.page.height;
+    let top = (baseline - (CARET_ASCENT + BAND_PADDING) * size)
+        .floor()
+        .max(0.0) as usize;
+    let bottom = (baseline + (CARET_DESCENT + BAND_PADDING) * size)
+        .ceil()
+        .max(0.0) as usize;
+    top.clamp(page_rows.start, page_rows.end)..bottom.clamp(page_rows.start, page_rows.end)
+}
+
+/// Draw CARET onto BUFFER, a copy of the pixels of IMAGE: a translucent band across the page at
+/// the caret's line, and a bar in COLOR (`0xRRGGBB`).
+pub fn draw_caret(buffer: &mut [u32], image: &PageImage, caret: &Caret, color: u32) {
+    if buffer.len() != image.width * image.height {
+        return;
+    }
+    let color = OPAQUE | (color & 0xFF_FFFF);
+    let width = image.width;
+    let page_columns = image.page.x..image.page.x + image.page.width;
+    for y in caret_band(image, caret) {
+        for pixel in &mut buffer[y * width + page_columns.start..y * width + page_columns.end] {
+            *pixel = mix(color, *pixel, BAND_OPACITY);
+        }
+    }
+    let (x, baseline) = image.pixel_at(caret.point);
+    let size = caret.size.to_pt() * image.pixel_per_pt;
+    let bar_width = (CARET_WIDTH * size).max(MIN_CARET_WIDTH).round();
+    let left = (x - bar_width / 2.0).round().max(0.0) as usize;
+    let columns = left.min(width)..(left + bar_width as usize).min(width);
+    let top = (baseline - CARET_ASCENT * size).round().max(0.0) as usize;
+    let bottom = (baseline + CARET_DESCENT * size).round().max(0.0) as usize;
+    for y in top.min(image.height)..bottom.min(image.height) {
+        buffer[y * width + columns.start..y * width + columns.end].fill(color);
+    }
+}
+
 /// A rectangle in an image, in pixels.
 #[derive(Debug, Clone, Copy)]
 pub struct Rect {
@@ -311,6 +363,56 @@ mod tests {
         let desk = 0xFF14_1414;
         let (pixels, page) = decorated(desk);
         assert!(luminance(pixels[20 * 48 + page.x - 1]) > luminance(desk));
+    }
+
+    /// A white 100x60 page at 2 pixels per point, in the middle of a 140x100 image.
+    fn blank_image() -> PageImage {
+        let (width, height) = (140, 100);
+        PageImage {
+            serial: 0,
+            width,
+            height,
+            pixels: vec![WHITE; width * height],
+            page: Rect {
+                x: 20,
+                y: 20,
+                width: 100,
+                height: 60,
+            },
+            pixel_per_pt: 2.0,
+            key: Key {
+                page: 0,
+                pixel_per_pt: 0,
+                width: 0,
+                desk: 0,
+            },
+        }
+    }
+
+    #[test]
+    fn draw_caret_draws_bar_and_band() {
+        let image = blank_image();
+        // 10pt text with its baseline at 15pt: 30 pixels below the page top.
+        let caret = Caret {
+            page: 0,
+            point: Point::new(Abs::pt(10.0), Abs::pt(15.0)),
+            size: Abs::pt(10.0),
+        };
+        let mut buffer = image.pixels.clone();
+        draw_caret(&mut buffer, &image, &caret, 0xFF_0000);
+        let at = |x: usize, y: usize| buffer[y * image.width + x];
+        let baseline = 20 + 30;
+        // The bar is at x = 20 + 2 * 10, from 0.8 em above the baseline to 0.2 em below.
+        assert_eq!(at(40, baseline - 1), 0xFFFF_0000);
+        assert_eq!(at(40, baseline - 15), 0xFFFF_0000);
+        assert_eq!(at(40, baseline + 3), 0xFFFF_0000);
+        // The band spans the page width, and stays inside the page.
+        let band = at(21, baseline - 1);
+        assert_eq!(band, mix(0xFFFF_0000, WHITE, BAND_OPACITY));
+        assert_eq!(at(119, baseline - 1), band);
+        assert_eq!(at(19, baseline - 1), WHITE);
+        assert_eq!(at(21, baseline - 25), WHITE);
+        assert_eq!(caret_band(&image, &caret), baseline - 19..baseline + 7);
     }
 
     #[test]

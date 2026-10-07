@@ -285,6 +285,63 @@ Return the status."
       (kill-buffer buffer)
       (delete-file file))))
 
+;;;; Forward sync
+
+(ert-deftest typst-canvas::caret-is-drawn-on-its-page ()
+  (typst-canvas-test--call-with-session
+   (lambda (session _)
+     (let ((text (concat typst-canvas-test--jump-page "A\n#pagebreak()\nHello")))
+       (typst-canvas-test--serve session text)
+       (pcase-let* ((`(,old ,new ,top ,bottom)
+                     (typst-canvas--session-set-caret session (string-search "Hello" text)
+                                                      #xff0000))
+                    (canvas (typst-canvas-test--canvas-for session 1))
+                    (`(,_serial ,_width ,_height ,page-x . ,_) (typst-canvas--page-info session 1))
+                    (x (+ page-x 2))
+                    (y (/ (+ top bottom) 2)))
+         (should-not old)
+         (should (= new 1))
+         (should (< top bottom))
+         (should (typst-canvas--present-page session 1 canvas))
+         ;; The line band tints the page with the caret color.
+         (let ((band (typst-canvas--canvas-pixel canvas x y)))
+           (should (= (logand (ash band -16) #xff) #xff))
+           (should (< (logand (ash band -8) #xff) #xff)))
+         ;; Hiding the caret clears it on the next copy.
+         (should (equal (typst-canvas--session-set-caret session nil 0) '(1 nil nil nil)))
+         (should (typst-canvas--present-page session 1 canvas))
+         (should (= (typst-canvas--canvas-pixel canvas x y) #xffffffff)))
+       ;; No caret in code.
+       (should-not (nth 1 (typst-canvas--session-set-caret
+                           session (string-search "pagebreak" text) 0)))))))
+
+(ert-deftest typst-canvas::caret-follows-point ()
+  (with-temp-buffer
+    (insert typst-canvas-test--jump-page "A\n#pagebreak()\nHello")
+    (typst-canvas-mode 1)
+    (unwind-protect
+        (let ((preview typst-canvas--preview))
+          (with-current-buffer preview
+            (typst-canvas-test--wait
+             (lambda () (and (= (length typst-canvas--serials) 2)
+                             (cl-every #'identity typst-canvas--serials)))))
+          (goto-char (point-max))
+          (run-hooks 'post-command-hook)
+          (typst-canvas-test--wait
+           (lambda () (eql (buffer-local-value 'typst-canvas--caret-page preview) 1)))
+          ;; In code, the caret disappears.
+          (search-backward "pagebreak")
+          (run-hooks 'post-command-hook)
+          (typst-canvas-test--wait
+           (lambda () (null (buffer-local-value 'typst-canvas--caret-page preview))))
+          ;; With `typst-canvas-follow-cursor' off, too.
+          (goto-char (point-max))
+          (let ((typst-canvas-follow-cursor nil))
+            (run-hooks 'post-command-hook)
+            (accept-process-output nil (* 3 typst-canvas--follow-delay)))
+          (should-not (buffer-local-value 'typst-canvas--caret-page preview)))
+      (typst-canvas-mode -1))))
+
 ;;;; Theme
 
 (ert-deftest typst-canvas::theme-colors-come-from-default-face ()

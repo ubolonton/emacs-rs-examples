@@ -178,8 +178,34 @@ fn page_info<'e>(env: &'e Env, session: &Session, index: usize) -> Result<Option
         .transpose()
 }
 
-/// Copy the image of page INDEX of SESSION into CANVAS, then refresh CANVAS.
-/// Return non-nil if CANVAS had the size of the image.
+/// Move the caret of SESSION to char offset CURSOR (0-based) of the main file, or hide it if
+/// CURSOR is nil or not in laid-out text. COLOR is the caret color, as #xRRGGBB. The offset is
+/// in the text of the last good compile.
+///
+/// Return (OLD NEW TOP BOTTOM). OLD and NEW are the pages of the previous and the new caret, or
+/// nil. Present them again to show the change. TOP and BOTTOM are the pixel rows of the new
+/// caret's line in the image of page NEW.
+#[defun]
+fn session_set_caret<'e>(
+    env: &'e Env,
+    session: &Session,
+    cursor: Option<usize>,
+    color: u32,
+) -> Result<Value<'e>> {
+    let (old, new) = session.set_caret(cursor, color);
+    let (page, top, bottom) = match new {
+        Some(place) => (
+            Some(place.page),
+            Some(place.rows.start),
+            Some(place.rows.end),
+        ),
+        None => (None, None, None),
+    };
+    env.list((old, page, top, bottom))
+}
+
+/// Copy the image of page INDEX of SESSION into CANVAS, with the caret if it is on that page.
+/// Then refresh CANVAS. Return non-nil if CANVAS had the size of the image.
 #[defun]
 fn present_page(env: &Env, session: &Session, index: usize, canvas: Value<'_>) -> Result<bool> {
     // Release the lock before the copy, so that the thread can publish meanwhile.
@@ -187,6 +213,8 @@ fn present_page(env: &Env, session: &Session, index: usize, canvas: Value<'_>) -
     let Some(image) = image else {
         return Ok(false);
     };
+    // The caret is drawn onto the copy, so the cached image stays clean.
+    let caret = session.caret_on(index);
     let copied = canvas.with_canvas_data(|data| {
         // Lisp resizes a canvas before it presents a page of a new size, but check anyway: a
         // mismatch must skip the copy, not panic.
@@ -194,6 +222,9 @@ fn present_page(env: &Env, session: &Session, index: usize, canvas: Value<'_>) -
             return false;
         }
         data.buffer.copy_from_slice(&image.pixels);
+        if let Some((caret, color)) = caret {
+            render::draw_caret(data.buffer, &image, &caret, color);
+        }
         true
     })?;
     if copied {

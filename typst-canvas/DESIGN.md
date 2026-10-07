@@ -16,7 +16,7 @@ Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates:
 | Zoom | Default: fit page width to the preview window body. `+`/`-`/`0` zoom; window resize re-renders. |
 | Errors | Diagnostics go to Flymake in the source buffer. The preview keeps the last good render and shows the error count in its header line. |
 | Backward sync | `mouse-1` on a page (hand pointer), or `RET` (the middle row of the visible part of the page at point, at several columns until one hits): `typst_ide::jump_from_click` → select the source window, go to the char, pulse the word (or the line). Other files open with `find-file-other-window`. Links open with `browse-url`; internal links scroll the preview. |
-| Forward sync | Point movement in the source (debounced): `typst_ide::jump_from_cursor` → draw a caret + line highlight in the page pixels, scroll the preview to keep it visible. |
+| Forward sync | `typst-canvas-follow-cursor` (default on). Point movement in the source (`post-command-hook`, debounced 0.1 s), and each new result: find the caret (page, point, font size) → draw a bar in the `cursor` face color and a translucent line band onto the canvas at copy time, so cached page images stay clean. Only the old and new caret pages are copied again. If the caret's line is not visible, scroll so that it is 1/3 from the top (`window-start` + pixel vscroll). No caret when point is not in laid-out text (e.g. in code). |
 | Theme | `typst-canvas-match-theme` (default on): page fill = `default` face background, text fill = foreground, set via `Library` styles (no source rewriting, so spans stay valid). Line and table strokes get the text color too; other default strokes stay black. Toggle with `t` (buffer-local in the preview). `enable-theme-functions`/`disable-theme-functions` re-apply it while a session exists. |
 | Look | Each canvas = page + margin in the desk color + 1-pixel border + soft drop shadow, drawn in Rust. Border and shadow get stronger on a dark desk (white-ish border, more opaque shadow). The canvas is at least as wide as the window, with the page centered. Desk color: `default` face background with its HSL lightness shifted 8% (darker if light, lighter if dark), so that pages stand out also when they match the theme. Hex colors are parsed without a frame (`color-values-from-color-spec`), because a text terminal frame rounds them. |
 | Stats | Preview header line: status, page count, compile ms, render ms, zoom. |
@@ -42,14 +42,15 @@ Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates:
   - Each `PageImage` has a key (page hash via `typst::utils::hash128(&Page)`, scale, window width, desk color) and a serial. A re-render reuses images with the same key, also if their page moved. Lisp copies a page only if its serial changed.
   - Scale: the widest page fits the window width minus margins, times the zoom. A pixel budget per page caps it.
 - `offset.rs`: UTF-8 byte ↔ Emacs char offset conversion.
-- `sync.rs`: click jumps (`jump_from_click` with a `Snapshot` world whose main file is the document's `Source`); cursor jumps (Phase 2).
+- `sync.rs`: click jumps (`jump_from_click` with a `Snapshot` world whose main file is the document's `Source`), and the caret. `typst_ide::jump_from_cursor` returns only the start of the text node, without a font size, so `sync::caret` does its node lookup and frame walk, but stops at the glyph of the cursor (`Glyph::span.1` is the glyph's byte offset in its node).
+  - The caret lives in `Session` (Lisp thread only), in points. `present_page` draws it with the current image's scale.
 
 Invariant: only defuns (Lisp thread) touch canvas memory, and only inside `with_canvas_data`. The
 thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, never panic.
 
 ## Lisp (`typst-canvas.el`)
 
-- `typst-canvas-mode`: minor mode for a `.typ` buffer. Starts a session, a pipe process, the preview window, the Flymake backend, `after-change-functions` (Phase 2: `post-command-hook`) handlers.
+- `typst-canvas-mode`: minor mode for a `.typ` buffer. Starts a session, a pipe process, the preview window, the Flymake backend, `after-change-functions` and `post-command-hook` handlers.
   - Changes schedule a zero-delay timer that sends the whole text once per command.
   - Teardown stops the session before it deletes the pipe process: in batch mode, Emacs does not ignore `SIGPIPE`.
   - Flymake: the backend stores the newest report function, and reports when diagnostics change. It has `flymake-always-safe`, because the user started the compile with the mode, not Flymake.

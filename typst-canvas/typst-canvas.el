@@ -49,6 +49,15 @@ See `display-buffer'."
   "Color around the pages, or nil to derive it from the `default' face background."
   :type '(choice (const :tag "From the default face" nil) color))
 
+(defcustom typst-canvas-follow-cursor t
+  "If non-nil, the preview shows the source cursor as a caret.
+It scrolls to keep the caret in view.  The caret is hidden when the
+cursor is not in text that is on a page, e.g. in code."
+  :type 'boolean)
+
+(defconst typst-canvas--follow-delay 0.1
+  "Seconds that point must stay still before the caret moves.")
+
 (defcustom typst-canvas-match-theme t
   "If non-nil, pages have the colors of the `default' face.
 Documents that set their own page or text colors keep them.  Toggle it
@@ -73,6 +82,8 @@ Without it, pages that match the theme would not stand out from the desk.")
 (defvar-local typst-canvas--report-fn nil "Newest Flymake report function.")
 (defvar-local typst-canvas--reported nil "Diagnostics last sent to Flymake.")
 (defvar-local typst-canvas--started-flymake nil "Non-nil if this mode turned on Flymake.")
+(defvar-local typst-canvas--caret-timer nil "Timer that moves the caret.")
+(defvar-local typst-canvas--caret-point nil "Point that the caret shows, or nil.")
 
 ;;;; State of the preview buffer
 
@@ -82,6 +93,7 @@ Without it, pages that match the theme would not stand out from the desk.")
   "Serial of the image last copied into each canvas, or nil.")
 (defvar-local typst-canvas--zoom 1.0 "Zoom factor.  1 fits the page width to the window.")
 (defvar-local typst-canvas--width nil "Window width of the newest request, in pixels.")
+(defvar-local typst-canvas--caret-page nil "Page of the caret (0-based), or nil.")
 
 ;;;; Source buffer
 
@@ -116,6 +128,7 @@ Without it, pages that match the theme would not stand out from the desk.")
                                        (typst-canvas--on-notify source))))
     (setq typst-canvas--session (typst-canvas--session-start root main typst-canvas--process))
     (add-hook 'after-change-functions #'typst-canvas--on-change nil t)
+    (add-hook 'post-command-hook #'typst-canvas--on-post-command nil t)
     (add-hook 'kill-buffer-hook #'typst-canvas--stop nil t)
     (add-hook 'flymake-diagnostic-functions #'typst-canvas-flymake nil t)
     (when (and typst-canvas-enable-flymake (not flymake-mode))
@@ -128,11 +141,16 @@ Without it, pages that match the theme would not stand out from the desk.")
 (defun typst-canvas--stop ()
   "Stop the session of the current buffer, and kill its preview."
   (remove-hook 'after-change-functions #'typst-canvas--on-change t)
+  (remove-hook 'post-command-hook #'typst-canvas--on-post-command t)
   (remove-hook 'kill-buffer-hook #'typst-canvas--stop t)
   (remove-hook 'flymake-diagnostic-functions #'typst-canvas-flymake t)
   (when typst-canvas--text-timer
     (cancel-timer typst-canvas--text-timer)
     (setq typst-canvas--text-timer nil))
+  (when typst-canvas--caret-timer
+    (cancel-timer typst-canvas--caret-timer)
+    (setq typst-canvas--caret-timer nil))
+  (setq typst-canvas--caret-point nil)
   ;; Stop the thread before deleting the process: in batch mode, Emacs does not ignore SIGPIPE,
   ;; so a write to a deleted pipe kills Emacs.
   (when typst-canvas--session
@@ -253,6 +271,8 @@ or the face colors are unknown."
                 (pages (nth 1 typst-canvas--status)))
             (with-current-buffer typst-canvas--preview
               (typst-canvas--show-pages session pages))))
+        ;; The pages changed, so the caret can be elsewhere.
+        (typst-canvas--update-caret)
         (typst-canvas--report-diagnostics)
         (force-mode-line-update t)))))
 
@@ -324,17 +344,23 @@ Each page is one canvas image on its own line."
   "Show COUNT pages of SESSION.  Copy only pages whose image changed."
   (typst-canvas--set-page-count count)
   (dotimes (index count)
-    (pcase-let ((`(,serial ,width ,height . ,_) (typst-canvas--page-info session index))
-                (canvas (aref typst-canvas--canvases index)))
-      (unless (or (null serial) (eql serial (aref typst-canvas--serials index)))
-        ;; A canvas spec is a plist after `image'.  `plist-put' changes existing keys in place,
-        ;; so the spec stays the same object, and so the same canvas.
-        (plist-put (cdr canvas) :data-width width)
-        (plist-put (cdr canvas) :data-height height)
-        ;; If the thread replaced the image meanwhile, the sizes can differ, and nothing is
-        ;; copied.  Its notification comes next.
-        (when (typst-canvas--present-page session index canvas)
-          (aset typst-canvas--serials index serial))))))
+    (unless (eql (car (typst-canvas--page-info session index))
+                 (aref typst-canvas--serials index))
+      (typst-canvas--present session index))))
+
+(defun typst-canvas--present (session index)
+  "Copy the image of page INDEX of SESSION into its canvas, with the caret."
+  (pcase-let ((`(,serial ,width ,height . ,_) (typst-canvas--page-info session index))
+              (canvas (aref typst-canvas--canvases index)))
+    (when serial
+      ;; A canvas spec is a plist after `image'.  `plist-put' changes existing keys in place, so
+      ;; the spec stays the same object, and so the same canvas.
+      (plist-put (cdr canvas) :data-width width)
+      (plist-put (cdr canvas) :data-height height)
+      ;; If the thread replaced the image meanwhile, the sizes can differ, and nothing is copied.
+      ;; Its notification comes next.
+      (when (typst-canvas--present-page session index canvas)
+        (aset typst-canvas--serials index serial)))))
 
 (defun typst-canvas--set-page-count (count)
   "Add or remove page lines at the end, so that there are COUNT."
@@ -451,6 +477,60 @@ See `typst-canvas-match-theme'."
   (setq-local typst-canvas-match-theme (not typst-canvas-match-theme))
   (typst-canvas--request-view)
   (message "Theme colors %s" (if typst-canvas-match-theme "on" "off")))
+
+;;;; Forward sync: from the source cursor to a caret on a page
+
+(defun typst-canvas--on-post-command ()
+  "Move the caret after point stays still for `typst-canvas--follow-delay'."
+  (unless (eql (and typst-canvas-follow-cursor (point)) typst-canvas--caret-point)
+    (when typst-canvas--caret-timer
+      (cancel-timer typst-canvas--caret-timer))
+    (setq typst-canvas--caret-timer
+          (run-with-timer typst-canvas--follow-delay nil
+                          #'typst-canvas--update-caret-of (current-buffer)))))
+
+(defun typst-canvas--update-caret-of (buffer)
+  "Move the caret of BUFFER, if it still has a session."
+  (when (buffer-live-p buffer)
+    (with-current-buffer buffer
+      (setq typst-canvas--caret-timer nil)
+      (when typst-canvas--session
+        (typst-canvas--update-caret)))))
+
+(defun typst-canvas--update-caret ()
+  "Show point as the caret in the preview, and scroll to it if it is out of view.
+Hide the caret if `typst-canvas-follow-cursor' is nil."
+  (let ((cursor (and typst-canvas-follow-cursor (point)))
+        (session typst-canvas--session))
+    (setq typst-canvas--caret-point cursor)
+    (pcase-let ((`(,old ,new ,top ,bottom)
+                 (typst-canvas--session-set-caret
+                  session (and cursor (1- cursor))
+                  (typst-canvas--color-value (face-background 'cursor nil t)))))
+      (when (buffer-live-p typst-canvas--preview)
+        (with-current-buffer typst-canvas--preview
+          (setq typst-canvas--caret-page new)
+          ;; Only the pages of the old and the new caret change.
+          (dolist (page (delete-dups (delq nil (list old new))))
+            (when (< page (length typst-canvas--canvases))
+              (typst-canvas--present session page)))
+          (when new
+            (typst-canvas--scroll-to-caret new top bottom)))))))
+
+(defun typst-canvas--scroll-to-caret (page top bottom)
+  "Scroll to pixel rows TOP to BOTTOM of PAGE, if they are not visible."
+  (when-let* ((window (get-buffer-window (current-buffer) t)))
+    (unless (typst-canvas--rows-visible-p window page top bottom)
+      (typst-canvas--scroll-to window page top))))
+
+(defun typst-canvas--rows-visible-p (window page top bottom)
+  "Return non-nil if pixel rows TOP to BOTTOM of PAGE are visible in WINDOW."
+  (pcase (pos-visible-in-window-p (typst-canvas--page-position page) window t)
+    ('nil nil)
+    (`(,_x ,_y) t)
+    (`(,_x ,_y ,hidden-top ,hidden-bottom . ,_)
+     (and (>= top hidden-top)
+          (<= bottom (- (typst-canvas--page-height page) hidden-bottom))))))
 
 ;;;; Backward sync: from a page to the source
 
