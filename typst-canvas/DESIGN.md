@@ -13,7 +13,7 @@ Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates:
 | Live | Each edit sends the buffer text to the compile thread. Latest text wins; stale requests are dropped. The UI never blocks on a compile. |
 | Notify | The thread writes to a pipe process (`Env::open_channel`) when a new result is ready. The pipe filter refreshes the preview. No polling timer. |
 | Pages | One canvas per page, stacked in a preview buffer. Only pages whose frame hash changed are re-rendered and re-copied. |
-| Zoom | Default: fit page width to the preview window body. `+`/`-`/`0` zoom; window resize re-renders. |
+| Zoom | Default: fit page width to the preview window body. `+`/`-`/`0` zoom; window resize re-renders. Over 100%, pages wider than the window scroll horizontally: `truncate-lines`, `auto-hscroll-mode` off (point is always at the start of a page line, so automatic hscroll would undo each scroll), `<left>`/`<right>`, `C-x <`/`>`, or shift + wheel. Emacs draws images cut at the left edge, and `posn-object-x-y` includes the hscroll, so clicks still map right. Zoom ≤ 100% resets hscroll. Caret scrolling is vertical only. |
 | Errors | Diagnostics go to Flymake in the source buffer. The preview keeps the last good render and shows the error count in its header line. |
 | Backward sync | `mouse-1` on a page (hand pointer), or `RET` (the middle row of the visible part of the page at point, at several columns until one hits): `typst_ide::jump_from_click` → select the source window, go to the char, pulse the word (or the line). Other files open with `find-file-other-window`. Links open with `browse-url`; internal links scroll the preview. |
 | Forward sync | `typst-canvas-follow-cursor` (default on). Point movement in the source (`post-command-hook`, debounced 0.1 s), and each new result: find the caret (page, point, font size) → draw a bar in the `cursor` face color and a translucent line band onto the canvas at copy time, so cached page images stay clean. Only the old and new caret pages are copied again. If the caret's line is not visible, scroll so that it is 1/3 from the top (`window-start` + pixel vscroll). No caret when point is not in laid-out text (e.g. in code). |
@@ -54,7 +54,7 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
   - Changes schedule a zero-delay timer that sends the whole text once per command.
   - Teardown stops the session before it deletes the pipe process: in batch mode, Emacs does not ignore `SIGPIPE`.
   - Flymake: the backend stores the newest report function, and reports when diagnostics change. It has `flymake-always-safe`, because the user started the compile with the mode, not Flymake.
-- `typst-canvas-preview-mode`: `special-mode` for `*typst-canvas: NAME*`. Keys: `+ - 0 t g q`, `n`/`p` pages, `mouse-1`/`RET` jump.
+- `typst-canvas-preview-mode`: `special-mode` for `*typst-canvas: NAME*`. Keys: `+ - 0 t g q`, `n`/`p` pages, `<left>`/`<right>` hscroll, `mouse-1`/`RET` jump.
   - `window-size-change-functions` re-renders when the window body width changes.
 - Each page is one line: an image char with a `typst-canvas-page` text property (0-based index), and a newline. Page lines are added or removed at the end.
 - Canvas specs get an uninterned `:id`: Emacs finds canvases by `eq` spec, but its image cache matches specs by `equal`. Resize: `plist-put` of `:data-width`/`:data-height` on the same spec.

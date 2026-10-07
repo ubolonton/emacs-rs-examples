@@ -318,6 +318,8 @@ DIAGNOSTIC is an element of `typst-canvas--session-diagnostics'."
   "n" #'typst-canvas-next-page
   "p" #'typst-canvas-previous-page
   "t" #'typst-canvas-toggle-theme
+  "<left>" #'typst-canvas-scroll-right
+  "<right>" #'typst-canvas-scroll-left
   "RET" #'typst-canvas-jump-at-point
   "<mouse-1>" #'typst-canvas-mouse-jump)
 
@@ -328,6 +330,9 @@ Each page is one canvas image on its own line."
   (setq cursor-type nil)
   ;; Scrolling to a point in a page leaves point on a line that can be partly visible.
   (setq-local make-cursor-line-fully-visible nil)
+  ;; Pages wider than the window (zoom over 100%) scroll horizontally.  Point is always at the
+  ;; start of a page line, so automatic hscroll would undo every scroll.  Like `image-mode'.
+  (setq-local auto-hscroll-mode nil)
   (setq header-line-format '(:eval (typst-canvas--header-line)))
   (setq-local revert-buffer-function #'typst-canvas--revert)
   (add-hook 'window-size-change-functions #'typst-canvas--on-resize nil t)
@@ -453,7 +458,24 @@ Each page is one canvas image on its own line."
   "Set the zoom of the preview to ZOOM, within `typst-canvas-zoom-range'."
   (setq typst-canvas--zoom (max (car typst-canvas-zoom-range)
                                 (min (cdr typst-canvas-zoom-range) zoom)))
+  ;; Up to 100%, pages are not wider than the window.
+  (when (<= typst-canvas--zoom 1)
+    (dolist (window (get-buffer-window-list (current-buffer) nil t))
+      (set-window-hscroll window 0)))
   (typst-canvas--request-view))
+
+(defconst typst-canvas--hscroll-step 8
+  "Columns that `typst-canvas-scroll-left' and `typst-canvas-scroll-right' scroll.")
+
+(defun typst-canvas-scroll-left (&optional count)
+  "Scroll the pages left by COUNT steps of `typst-canvas--hscroll-step' columns."
+  (interactive "p" typst-canvas-preview-mode)
+  (scroll-left (* (or count 1) typst-canvas--hscroll-step)))
+
+(defun typst-canvas-scroll-right (&optional count)
+  "Scroll the pages right by COUNT steps of `typst-canvas--hscroll-step' columns."
+  (interactive "p" typst-canvas-preview-mode)
+  (scroll-right (* (or count 1) typst-canvas--hscroll-step)))
 
 (defun typst-canvas-zoom-in ()
   "Zoom in by `typst-canvas-zoom-step'."

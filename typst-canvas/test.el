@@ -342,6 +342,28 @@ Return the status."
           (should-not (buffer-local-value 'typst-canvas--caret-page preview)))
       (typst-canvas-mode -1))))
 
+;;;; Zoom
+
+(ert-deftest typst-canvas::zoomed-pages-scroll-horizontally ()
+  (with-temp-buffer
+    (insert typst-canvas-test--page "A")
+    (typst-canvas-mode 1)
+    (unwind-protect
+        (with-current-buffer typst-canvas--preview
+          (with-selected-window (get-buffer-window (current-buffer))
+            (typst-canvas-zoom-in)
+            (typst-canvas-zoom-in)
+            (should (> typst-canvas--zoom 1))
+            (should-not auto-hscroll-mode)
+            (typst-canvas-scroll-left 2)
+            (should (= (window-hscroll) (* 2 typst-canvas--hscroll-step)))
+            (typst-canvas-scroll-right)
+            (should (= (window-hscroll) typst-canvas--hscroll-step))
+            ;; Fitting the width again shows the left edge.
+            (typst-canvas-zoom-fit)
+            (should (= (window-hscroll) 0))))
+      (typst-canvas-mode -1))))
+
 ;;;; Theme
 
 (ert-deftest typst-canvas::theme-colors-come-from-default-face ()
