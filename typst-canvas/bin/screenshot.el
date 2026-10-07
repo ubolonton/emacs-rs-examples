@@ -1,7 +1,12 @@
 ;;; screenshot.el --- Screenshots of typst-canvas, for bin/screenshot.sh -*- lexical-binding: t -*-
 
 ;; Opens examples/sample.typ with `typst-canvas-mode', then saves target/screenshot-N.png at each
-;; step: fit width, a compile error, zoomed in on page 2.
+;; step:
+;; 1. Light theme, with the caret on page 2.
+;; 2. A compile error: Flymake, and the stale pages.
+;; 3. `modus-vivendi' (dark), loaded at run time, with theme matching.
+;; 4. Right after a click on the caret's line: the jump target pulses in the source.
+;; 5. Zoomed in, scrolled right.
 
 (require 'cl-lib)
 (require 'typst-canvas)
@@ -51,6 +56,32 @@
                          (buffer-local-value 'typst-canvas--preview typst-canvas-screenshot--source))
     (funcall function)))
 
+(defun typst-canvas-screenshot--move-caret (text)
+  "Move point in the source to the end of the first TEXT, and move the caret there."
+  (with-current-buffer typst-canvas-screenshot--source
+    (goto-char (point-min))
+    (search-forward text)
+    (typst-canvas--update-caret)))
+
+(defun typst-canvas-screenshot--caret-line-click ()
+  "Return a click position on text in the caret's line, in the preview window."
+  (with-current-buffer typst-canvas-screenshot--source
+    (let ((session typst-canvas--session)
+          (preview typst-canvas--preview))
+      (pcase-let ((`(,_old ,page ,top ,bottom)
+                   (typst-canvas--session-set-caret session (1- (point)) 0)))
+        (with-current-buffer preview
+          (let* ((window (get-buffer-window preview))
+                 (row (/ (+ top bottom) 2))
+                 ;; Window and image coordinates differ by a constant: correct a first guess.
+                 (guess (cdr (posn-object-x-y (posn-at-x-y 40 100 window))))
+                 (window-y (+ 100 (- row guess))))
+            (cl-loop for window-x from 40 below (window-body-width window t) by 10
+                     for position = (posn-at-x-y window-x window-y window)
+                     for xy = (posn-object-x-y position)
+                     when (and xy (typst-canvas--session-jump session page (car xy) (cdr xy)))
+                     return position)))))))
+
 (set-frame-size nil 1280 800 t)
 (delete-other-windows)
 (find-file (expand-file-name "examples/sample.typ" typst-canvas-screenshot--root))
@@ -60,26 +91,44 @@
 (setq-local create-lockfiles nil)
 (typst-canvas-mode 1)
 (run-with-timer typst-canvas-screenshot--timeout nil #'kill-emacs 1)
-(run-with-timer
- 0.5 nil #'typst-canvas-screenshot--run
- (list
-  ;; Wait for redisplay after the first result, so that the window width is final.
-  #'ignore
-  (lambda () (typst-canvas-screenshot--save "screenshot-1.png"))
-  (lambda ()
-    (with-current-buffer typst-canvas-screenshot--source
-      (goto-char (point-max))
-      (insert "\n#nope")
-      (flymake-start)))
-  (lambda () (typst-canvas-screenshot--save "screenshot-2.png"))
-  (lambda ()
-    (with-current-buffer typst-canvas-screenshot--source
-      (delete-region (- (point-max) 6) (point-max)))
-    (typst-canvas-screenshot--in-preview
-     (lambda ()
-       (typst-canvas-zoom-in)
-       (typst-canvas-zoom-in)
-       (typst-canvas-next-page))))
-  (lambda () (typst-canvas-screenshot--save "screenshot-3.png"))))
+(let (click)
+  (run-with-timer
+   0.5 nil #'typst-canvas-screenshot--run
+   (list
+    ;; Wait for redisplay after the first result, so that the window width is final.
+    #'ignore
+    (lambda () (typst-canvas-screenshot--move-caret "copy changed pa"))
+    (lambda () (typst-canvas-screenshot--save "screenshot-1.png"))
+    (lambda ()
+      (with-current-buffer typst-canvas-screenshot--source
+        (goto-char (point-max))
+        (insert "\n#nope")
+        (flymake-start)))
+    (lambda () (typst-canvas-screenshot--save "screenshot-2.png"))
+    (lambda ()
+      (with-current-buffer typst-canvas-screenshot--source
+        (delete-region (- (point-max) 6) (point-max)))
+      (load-theme 'modus-vivendi t))
+    (lambda () (typst-canvas-screenshot--move-caret "[3], [noti"))
+    (lambda () (typst-canvas-screenshot--save "screenshot-3.png"))
+    (lambda ()
+      (setq click (typst-canvas-screenshot--caret-line-click))
+      ;; Without the caret, the pulse is the only mark of the jump.
+      (with-current-buffer typst-canvas-screenshot--source
+        (goto-char (point-min))
+        (typst-canvas--update-caret)))
+    (lambda ()
+      (typst-canvas-mouse-jump (list 'mouse-1 click))
+      ;; The pulse fades out, so take the screenshot right away.
+      (redisplay t)
+      (typst-canvas-screenshot--save "screenshot-4.png"))
+    (lambda ()
+      (typst-canvas-screenshot--in-preview
+       (lambda ()
+         (typst-canvas-zoom-in)
+         (typst-canvas-zoom-in)
+         (typst-canvas-zoom-in)
+         (typst-canvas-scroll-left 5))))
+    (lambda () (typst-canvas-screenshot--save "screenshot-5.png")))))
 
 ;;; screenshot.el ends here

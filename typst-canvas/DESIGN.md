@@ -63,12 +63,12 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
 
 - `cargo test`: Rust unit tests (offsets, pixel conversion, compile, diagnostics, session thread).
 - `bin/test.sh`: ERT in batch mode (`EMACS=emacs-32-gtk`).
-- `bin/screenshot.sh`: GUI under Xvfb, saves PNGs to `target/`.
+- `bin/screenshot.sh`: GUI under Xvfb (`bin/screenshot.el`), saves `target/screenshot-{1..5}.png`: light theme with the caret, a compile error (stale pages), `modus-vivendi` loaded at run time, the pulse right after a click jump, zoom + hscroll.
 
 ## Phases
 
 1. Core: scaffold, world, session thread, pipe notify, multi-page canvases, fit/zoom, diagnostics (header line + Flymake), tests, scripts.
-2. Sync and polish: backward/forward sync, theme, page decoration. (Phase 1 already reuses page images by key.)
+2. Sync and polish: backward/forward sync, theme, page decoration, zoom hscroll, header line. (Phase 1 already reuses page images by key.)
 3. Showcase: demo document, self-typing demo command, screencast (GIF), README.
 4. Review: code review pass, fixes, docs.
 
