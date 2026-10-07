@@ -43,7 +43,7 @@ Fail after `typst-canvas-test--timeout' seconds."
   "Send TEXT to SESSION at WIDTH (default 300) pixels.  Wait until it is served.
 Return the status."
   (let ((id (typst-canvas--session-request session text (or width 300) 1.0
-                                           typst-canvas-test--desk)))
+                                           typst-canvas-test--desk nil nil)))
     (typst-canvas-test--wait (lambda () (>= (car (typst-canvas--session-status session)) id)))
     (typst-canvas--session-status session)))
 
@@ -131,7 +131,7 @@ Return the status."
   (typst-canvas-test--call-with-session
    (lambda (session notifications)
      (should (= (funcall notifications) 0))
-     (typst-canvas--session-request session typst-canvas-test--page 300 1.0 0)
+     (typst-canvas--session-request session typst-canvas-test--page 300 1.0 0 nil nil)
      (typst-canvas-test--wait (lambda () (> (funcall notifications) 0))))))
 
 (ert-deftest typst-canvas::stop-ends-session ()
@@ -142,7 +142,7 @@ Return the status."
      (typst-canvas--session-stop session)
      (let ((served (car (typst-canvas--session-status session)))
            (count (funcall notifications)))
-       (typst-canvas--session-request session "B" 300 1.0 0)
+       (typst-canvas--session-request session "B" 300 1.0 0 nil nil)
        (accept-process-output nil 0.5)
        (should (= (car (typst-canvas--session-status session)) served))
        (should (= (funcall notifications) count))
@@ -220,5 +220,48 @@ Return the status."
       (with-current-buffer typst-buffer
         (should-not typst-canvas-mode)
         (should-not typst-canvas--session)))))
+
+;;;; Theme
+
+(ert-deftest typst-canvas::theme-colors-come-from-default-face ()
+  (cl-letf (((symbol-function 'face-background) (lambda (&rest _) "#ffffff"))
+            ((symbol-function 'face-foreground) (lambda (&rest _) "#202020")))
+    (pcase-let ((`(,desk ,page ,ink) (typst-canvas--colors t)))
+      (should (= page #xffffff))
+      (should (= ink #x202020))
+      ;; The desk is darker than a light page, so that the page stands out.
+      (should (< desk page)))
+    (should (equal (cdr (typst-canvas--colors nil)) '(nil nil))))
+  (cl-letf (((symbol-function 'face-background) (lambda (&rest _) "#000000"))
+            ((symbol-function 'face-foreground) (lambda (&rest _) "#ffffff")))
+    ;; The desk is lighter than a black page.
+    (should (> (car (typst-canvas--colors t)) 0))))
+
+(ert-deftest typst-canvas::theme-colors-pages ()
+  (typst-canvas-test--call-with-session
+   (lambda (session _)
+     (let ((id (typst-canvas--session-request session typst-canvas-test--page 300 1.0
+                                              typst-canvas-test--desk #x000000 #xffffff)))
+       (typst-canvas-test--wait (lambda () (>= (car (typst-canvas--session-status session)) id))))
+     (let* ((canvas (typst-canvas-test--canvas-for session 0))
+            (width (plist-get (cdr canvas) :data-width))
+            (height (plist-get (cdr canvas) :data-height)))
+       (should (typst-canvas--present-page session 0 canvas))
+       (should (= (typst-canvas--canvas-pixel canvas (/ width 2) (/ height 2)) #xFF000000))))))
+
+(ert-deftest typst-canvas::toggle-theme-sends-request ()
+  (with-temp-buffer
+    (insert typst-canvas-test--page)
+    (typst-canvas-mode 1)
+    (unwind-protect
+        (let ((sent typst-canvas--sent))
+          (with-current-buffer typst-canvas--preview
+            (typst-canvas-toggle-theme)
+            (should-not typst-canvas-match-theme))
+          (should (> typst-canvas--sent sent))
+          ;; The hooks are on while there is a session.
+          (should (memq #'typst-canvas--on-theme-change enable-theme-functions)))
+      (typst-canvas-mode -1))
+    (should-not (memq #'typst-canvas--on-theme-change enable-theme-functions))))
 
 ;;; test.el ends here

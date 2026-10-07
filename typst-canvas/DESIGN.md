@@ -17,8 +17,8 @@ Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates:
 | Errors | Diagnostics go to Flymake in the source buffer. The preview keeps the last good render and shows the error count in its header line. |
 | Backward sync | `mouse-1` on a page: `typst_ide::jump_from_click` → move point in the source window and pulse the region. Links open with `browse-url`; internal links scroll the preview. |
 | Forward sync | Point movement in the source (debounced): `typst_ide::jump_from_cursor` → draw a caret + line highlight in the page pixels, scroll the preview to keep it visible. |
-| Theme | Optional: page fill = `default` face background, text fill = foreground, set via `Library` styles (no source rewriting, so spans stay valid). Toggle with `t`. |
-| Look | Each canvas = page + margin in the desk color + 1-pixel border + soft drop shadow, drawn in Rust. Border and shadow get stronger on a dark desk (white-ish border, more opaque shadow). The canvas is at least as wide as the window, with the page centered. Desk color: `default` face background, darkened 8% if light, so that white pages stand out. |
+| Theme | `typst-canvas-match-theme` (default on): page fill = `default` face background, text fill = foreground, set via `Library` styles (no source rewriting, so spans stay valid). Line and table strokes get the text color too; other default strokes stay black. Toggle with `t` (buffer-local in the preview). `enable-theme-functions`/`disable-theme-functions` re-apply it while a session exists. |
+| Look | Each canvas = page + margin in the desk color + 1-pixel border + soft drop shadow, drawn in Rust. Border and shadow get stronger on a dark desk (white-ish border, more opaque shadow). The canvas is at least as wide as the window, with the page centered. Desk color: `default` face background with its HSL lightness shifted 8% (darker if light, lighter if dark), so that pages stand out also when they match the theme. Hex colors are parsed without a frame (`color-values-from-color-spec`), because a text terminal frame rounds them. |
 | Stats | Preview header line: status, page count, compile ms, render ms, zoom. |
 
 ## Rust (`src/`)
@@ -32,7 +32,7 @@ Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates:
   - Diagnostics: converted to char ranges in the main file. A diagnostic in another file goes to the innermost main-file call site in its trace, with the file name in the message.
 - `session.rs`: `Session`, owned by Lisp as a `user-ptr`. Drop stops and joins the thread.
   - All shared state is in one `Arc<Shared>`: request slot, world, output.
-  - Request slot: `Mutex<Slot>` + `Condvar`. A request carries the new text (optional) and the view (fit width px, zoom, desk color; Phase 2: theme colors). A new request replaces an unserved one, but keeps its text if it has none. Each request gets an ID.
+  - Request slot: `Mutex<Slot>` + `Condvar`. A request carries the new text (optional), the theme colors (optional), and the view (fit width px, zoom, desk color). A theme change compiles again, also without new text. A new request replaces an unserved one, but keeps its text if it has none. Each request gets an ID.
   - World: `Mutex<PreviewWorld>`; the thread locks it for update + compile. Phase 2: the Lisp thread locks it briefly for jumps.
   - Output: `Mutex<Output>` with the ID of the newest served request (Lisp compares it with the newest sent ID to show "compiling"), the last good document (`Arc`), rendered pages (`Arc<PageImage>`), diagnostics, compile ms, render ms.
   - Notify: after each served request, the thread writes `"\n"` to the pipe. Write errors are ignored.
@@ -52,7 +52,7 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
   - Changes schedule a zero-delay timer that sends the whole text once per command.
   - Teardown stops the session before it deletes the pipe process: in batch mode, Emacs does not ignore `SIGPIPE`.
   - Flymake: the backend stores the newest report function, and reports when diagnostics change. It has `flymake-always-safe`, because the user started the compile with the mode, not Flymake.
-- `typst-canvas-preview-mode`: `special-mode` for `*typst-canvas: NAME*`. Keys: `+ - 0 g q`, `n`/`p` pages. Phase 2: `t` theme, `mouse-1` jump.
+- `typst-canvas-preview-mode`: `special-mode` for `*typst-canvas: NAME*`. Keys: `+ - 0 t g q`, `n`/`p` pages. Phase 2: `mouse-1` jump.
   - `window-size-change-functions` re-renders when the window body width changes.
 - Each page is one line: an image char with a `typst-canvas-page` text property (0-based index), and a newline. Page lines are added or removed at the end.
 - Canvas specs get an uninterned `:id`: Emacs finds canvases by `eq` spec, but its image cache matches specs by `equal`. Resize: `plist-put` of `:data-width`/`:data-height` on the same spec.

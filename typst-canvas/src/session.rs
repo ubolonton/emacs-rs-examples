@@ -17,7 +17,7 @@ use typst_layout::PagedDocument;
 
 use crate::{
     render::{self, PageImage, View},
-    world::{Compiled, Diagnostic, PreviewWorld},
+    world::{Compiled, Diagnostic, PreviewWorld, Theme},
 };
 
 /// Memoized results unused for this many compiles are evicted. Same as `typst watch`.
@@ -29,6 +29,8 @@ const STACK_SIZE: usize = 8 * 1024 * 1024;
 pub struct Request {
     /// New text of the main file. `None` re-renders the last good document, e.g. after a zoom.
     pub text: Option<String>,
+    /// Default colors. A change compiles the document again, also without new text.
+    pub theme: Option<Theme>,
     pub view: View,
 }
 
@@ -167,19 +169,24 @@ impl Shared {
     }
 
     fn serve(&self, id: u64, request: Request) {
-        let compiled = request.text.map(|text| {
-            let start = Instant::now();
-            let Compiled {
-                document,
-                diagnostics,
-            } = {
-                let mut world = lock(&self.world);
-                world.set_main_text(&text);
-                world.compile()
-            };
-            typst::comemo::evict(EVICTION_AGE);
-            (document.map(Arc::new), diagnostics, elapsed_ms(start))
-        });
+        let start = Instant::now();
+        let compiled = {
+            let mut world = lock(&self.world);
+            let theme_changed = world.set_theme(request.theme);
+            if let Some(text) = &request.text {
+                world.set_main_text(text);
+            }
+            (theme_changed || request.text.is_some()).then(|| world.compile())
+        };
+        let compiled = compiled.map(
+            |Compiled {
+                 document,
+                 diagnostics,
+             }| {
+                typst::comemo::evict(EVICTION_AGE);
+                (document.map(Arc::new), diagnostics, elapsed_ms(start))
+            },
+        );
         let new_document = compiled
             .as_ref()
             .and_then(|(document, ..)| document.clone());
@@ -286,6 +293,7 @@ mod tests {
         let text = Some("#set page(width: 100pt, height: 50pt)\nA\n#pagebreak()\nB".into());
         let id = session.request(Request {
             text,
+            theme: None,
             view: view(200),
         });
         wait_for(&session, &notifications, id);
@@ -301,6 +309,7 @@ mod tests {
 
         let id = session.request(Request {
             text: Some("#nope".into()),
+            theme: None,
             view: view(200),
         });
         wait_for(&session, &notifications, id);
@@ -319,10 +328,12 @@ mod tests {
         let text = Some("#set page(width: 100pt, height: 50pt)\nA".into());
         session.request(Request {
             text,
+            theme: None,
             view: view(200),
         });
         let id = session.request(Request {
             text: None,
+            theme: None,
             view: view(300),
         });
         wait_for(&session, &notifications, id);
@@ -332,10 +343,39 @@ mod tests {
     }
 
     #[test]
+    fn theme_change_compiles_again() {
+        let (session, notifications) = start();
+        let text = Some("#set page(width: 100pt, height: 50pt)".into());
+        let id = session.request(Request {
+            text,
+            theme: None,
+            view: view(200),
+        });
+        wait_for(&session, &notifications, id);
+        let id = session.request(Request {
+            text: None,
+            theme: Some(Theme {
+                page: 0x00_0000,
+                text: 0xFF_FFFF,
+            }),
+            view: view(200),
+        });
+        wait_for(&session, &notifications, id);
+        let output = session.output();
+        let image = &output.pages[0];
+        // The middle of the page has the theme's page color.
+        assert_eq!(
+            image.pixels[image.height / 2 * image.width + image.width / 2],
+            0xFF00_0000
+        );
+    }
+
+    #[test]
     fn stop_joins_thread() {
         let (mut session, notifications) = start();
         session.request(Request {
             text: Some("A".into()),
+            theme: None,
             view: view(200),
         });
         session.stop();

@@ -17,7 +17,7 @@ use typst::diag::Severity;
 use crate::{
     render::View,
     session::{Request, Session},
-    world::PreviewWorld,
+    world::{PreviewWorld, Theme},
 };
 
 emacs::plugin_is_GPL_compatible!();
@@ -46,7 +46,8 @@ fn session_start(env: &Env, root: String, main: String, notify: Value<'_>) -> Re
 ///
 /// TEXT is the new text of the main file, or nil to only re-render the last good document. WIDTH
 /// is the preview window body width in pixels. ZOOM is a factor relative to fit-width. DESK is the
-/// color around pages, as #xRRGGBB.
+/// color around pages. PAGE and INK are the default page and text colors, or nil for Typst's
+/// defaults. Colors are #xRRGGBB.
 #[defun]
 fn session_request(
     session: &Session,
@@ -54,9 +55,13 @@ fn session_request(
     width: u32,
     zoom: f64,
     desk: u32,
+    page: Option<u32>,
+    ink: Option<u32>,
 ) -> Result<u64> {
+    let theme = page.zip(ink).map(|(page, text)| Theme { page, text });
     Ok(session.request(Request {
         text,
+        theme,
         view: View { width, zoom, desk },
     }))
 }

@@ -3,16 +3,19 @@
 use std::{
     ops::Range,
     path::{Path, PathBuf},
-    sync::LazyLock,
+    sync::{Arc, LazyLock},
 };
 
 use typst::{
     Library, LibraryExt, World, WorldExt,
     diag::{FileResult, Severity, SourceDiagnostic, Warned},
-    foundations::{Bytes, Datetime, Duration},
+    foundations::{Bytes, Datetime, Duration, Smart},
+    layout::{Celled, PageElem, Sides},
+    model::TableElem,
     syntax::{DiagSpan, FileId, RootedPath, Source, VirtualPath, VirtualRoot},
-    text::{Font, FontBook},
+    text::{Font, FontBook, TextElem},
     utils::LazyHash,
+    visualize::{Color, LineElem, Paint, Stroke},
 };
 use typst_ide::IdeWorld;
 use typst_kit::{
@@ -42,6 +45,7 @@ pub struct PreviewWorld {
     /// The buffer text. It is edited in place, so that Typst can reparse incrementally.
     main: Source,
     library: LazyHash<Library>,
+    theme: Option<Theme>,
     /// Other project files and packages, loaded from disk on demand.
     files: FileStore<SystemFiles>,
     time: Time,
@@ -65,6 +69,13 @@ pub struct Compiled {
 #[derive(Debug)]
 pub struct MainOutsideRoot;
 
+/// Default page and text colors, as `0xRRGGBB`. Documents can still set their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Theme {
+    pub page: u32,
+    pub text: u32,
+}
+
 impl PreviewWorld {
     /// Create a world whose project root is ROOT, and whose main file is at MAIN.
     ///
@@ -76,7 +87,8 @@ impl PreviewWorld {
         let files = SystemFiles::new(FsRoot::new(PathBuf::from(root)), packages);
         Ok(Self {
             main: Source::new(id, String::new()),
-            library: LazyHash::new(Library::default()),
+            library: LazyHash::new(library(None)),
+            theme: None,
             files: FileStore::new(files),
             time: Time::system(),
         })
@@ -88,6 +100,20 @@ impl PreviewWorld {
         self.main.replace(text);
         self.files.reset();
         self.time = Time::system();
+    }
+
+    /// Set the default colors. Return true if they changed, and so the document must be compiled
+    /// again.
+    ///
+    /// The colors are styles of the standard library, not a `#set` rule in the source, so spans
+    /// stay valid.
+    pub fn set_theme(&mut self, theme: Option<Theme>) -> bool {
+        if self.theme == theme {
+            return false;
+        }
+        self.theme = theme;
+        self.library = LazyHash::new(library(theme));
+        true
     }
 
     pub fn compile(&self) -> Compiled {
@@ -147,6 +173,35 @@ impl PreviewWorld {
             message,
         }
     }
+}
+
+/// Return the standard library, with THEME's default colors if there is one.
+fn library(theme: Option<Theme>) -> Library {
+    let mut library = Library::default();
+    if let Some(Theme { page, text }) = theme {
+        let text = Paint::from(color(text));
+        library
+            .styles
+            .set(PageElem::fill, Smart::Custom(Some(color(page).into())));
+        library.styles.set(TextElem::fill, text.clone());
+        // Strokes default to black, which disappears on a dark page. Give the most common ones the
+        // text color.
+        let stroke = Stroke {
+            paint: Smart::Custom(text),
+            ..Stroke::default()
+        };
+        library.styles.set(LineElem::stroke, stroke.clone());
+        library.styles.set(
+            TableElem::stroke,
+            Celled::Value(Sides::splat(Some(Some(Arc::new(stroke))))),
+        );
+    }
+    library
+}
+
+fn color(rgb: u32) -> Color {
+    let [_, red, green, blue] = rgb.to_be_bytes();
+    Color::from_u8(red, green, blue, u8::MAX)
 }
 
 impl World for PreviewWorld {
@@ -248,6 +303,36 @@ mod tests {
                 .starts_with("tests/fixtures/broken.typ: unknown variable: nope"),
             "{}",
             diagnostic.message
+        );
+    }
+
+    #[test]
+    fn theme_sets_default_colors() {
+        let mut world = world("#rect(width: 1pt, height: 1pt)");
+        assert!(world.set_theme(Some(Theme {
+            page: 0x10_2030,
+            text: 0xF0_E0D0,
+        })));
+        assert!(!world.set_theme(Some(Theme {
+            page: 0x10_2030,
+            text: 0xF0_E0D0,
+        })));
+        let compiled = world.compile();
+        let Some(document) = compiled.document else {
+            panic!("{:?}", compiled.diagnostics);
+        };
+        let page = &document.pages()[0];
+        assert_eq!(
+            page.fill,
+            Smart::Custom(Some(Color::from_u8(0x10, 0x20, 0x30, 0xFF).into()))
+        );
+        assert!(world.set_theme(None));
+        let compiled = world.compile();
+        assert_eq!(
+            compiled
+                .document
+                .map(|document| document.pages()[0].fill.clone()),
+            Some(Smart::Auto)
         );
     }
 

@@ -48,12 +48,18 @@ See `display-buffer'."
   "Color around the pages, or nil to derive it from the `default' face background."
   :type '(choice (const :tag "From the default face" nil) color))
 
+(defcustom typst-canvas-match-theme t
+  "If non-nil, pages have the colors of the `default' face.
+Documents that set their own page or text colors keep them.  Toggle it
+in a preview with `typst-canvas-toggle-theme'."
+  :type 'boolean)
+
 (defconst typst-canvas--fallback-desk "#808080"
   "Desk color if the `default' face has no known background, e.g. in batch mode.")
 
-(defconst typst-canvas--light-desk-darkening 8
-  "Percent by which a light `default' background is darkened for the desk.
-Without this, white pages would not stand out from a white background.")
+(defconst typst-canvas--desk-lightness-shift 8
+  "Percent by which the desk lightness differs from the `default' background.
+Without it, pages that match the theme would not stand out from the desk.")
 
 ;;;; State of the source buffer
 
@@ -114,6 +120,7 @@ Without this, white pages would not stand out from a white background.")
     (when (and typst-canvas-enable-flymake (not flymake-mode))
       (setq typst-canvas--started-flymake t)
       (flymake-mode 1))
+    (typst-canvas--update-theme-hooks)
     (display-buffer preview typst-canvas-display-action)
     (typst-canvas--send-text)))
 
@@ -140,6 +147,7 @@ Without this, white pages would not stand out from a white background.")
         typst-canvas--reported nil
         typst-canvas--status nil
         typst-canvas--sent 0)
+  (typst-canvas--update-theme-hooks)
   (let ((preview typst-canvas--preview))
     (setq typst-canvas--preview nil)
     (when (buffer-live-p preview)
@@ -168,32 +176,70 @@ One send covers all the changes of a command, e.g. of `replace-regexp'."
 
 (defun typst-canvas--request (text)
   "Send TEXT and the preview view to the session of the current buffer.
-TEXT nil only re-renders the last good document."
+TEXT nil only re-renders the last good document, or compiles it again
+if the theme colors changed."
   (let ((width typst-canvas-default-width)
-        (zoom 1.0))
+        (zoom 1.0)
+        (match-theme typst-canvas-match-theme))
     (when (buffer-live-p typst-canvas--preview)
       (with-current-buffer typst-canvas--preview
         (setq typst-canvas--width (typst-canvas--window-width))
         (setq width typst-canvas--width
-              zoom typst-canvas--zoom)))
-    (setq typst-canvas--sent
-          (typst-canvas--session-request typst-canvas--session text width zoom
-                                         (typst-canvas--desk-color)))
+              zoom typst-canvas--zoom
+              ;; `typst-canvas-toggle-theme' sets it locally in the preview.
+              match-theme typst-canvas-match-theme)))
+    (pcase-let ((`(,desk ,page ,ink) (typst-canvas--colors match-theme)))
+      (setq typst-canvas--sent
+            (typst-canvas--session-request typst-canvas--session text width zoom
+                                           desk page ink)))
     (force-mode-line-update t)))
 
-(defun typst-canvas--desk-color ()
-  "Return the desk color, as #xRRGGBB."
-  (let* ((name (or typst-canvas-desk-color
-                   (let ((background (face-background 'default nil t)))
-                     (if (color-defined-p background)
-                         (if (color-dark-p (color-name-to-rgb background))
-                             background
-                           (color-darken-name background typst-canvas--light-desk-darkening))
-                       typst-canvas--fallback-desk))))
-         (rgb (or (color-name-to-rgb name)
-                  (color-name-to-rgb typst-canvas--fallback-desk))))
-    (cl-reduce (lambda (pixel component) (logior (ash pixel 8) (round (* 255 component))))
-               rgb :initial-value 0)))
+(defun typst-canvas--colors (match-theme)
+  "Return (DESK PAGE INK) as #xRRGGBB, from the `default' face.
+PAGE and INK are the page and text colors, or nil if MATCH-THEME is nil
+or the face colors are unknown."
+  (let* ((background (face-background 'default nil t))
+         (foreground (face-foreground 'default nil t))
+         (known (and (color-defined-p background) (color-defined-p foreground)))
+         (desk (cond (typst-canvas-desk-color)
+                     (known (typst-canvas--shift-lightness background))
+                     (t typst-canvas--fallback-desk))))
+    (list (typst-canvas--color-value desk)
+          (and match-theme known (typst-canvas--color-value background))
+          (and match-theme known (typst-canvas--color-value foreground)))))
+
+(defun typst-canvas--shift-lightness (color)
+  "Return COLOR darkened if it is light, or lightened if it is dark."
+  (if (color-dark-p (color-name-to-rgb color))
+      (color-lighten-name color typst-canvas--desk-lightness-shift)
+    (color-darken-name color typst-canvas--desk-lightness-shift)))
+
+(defun typst-canvas--color-value (color)
+  "Return COLOR as #xRRGGBB.  Unknown colors give the fallback desk color."
+  ;; Parse "#RRGGBB" without a frame: a text terminal frame would round it to a terminal color.
+  (let ((values (or (color-values-from-color-spec color)
+                    (color-values color)
+                    (color-values-from-color-spec typst-canvas--fallback-desk))))
+    ;; Each value is 16-bit.
+    (cl-reduce (lambda (pixel value) (logior (ash pixel 8) (ash value -8)))
+               values :initial-value 0)))
+
+(defun typst-canvas--update-theme-hooks ()
+  "Watch theme changes while any buffer has a session."
+  (if (seq-some (lambda (buffer) (buffer-local-value 'typst-canvas--session buffer))
+                (buffer-list))
+      (progn
+        (add-hook 'enable-theme-functions #'typst-canvas--on-theme-change)
+        (add-hook 'disable-theme-functions #'typst-canvas--on-theme-change))
+    (remove-hook 'enable-theme-functions #'typst-canvas--on-theme-change)
+    (remove-hook 'disable-theme-functions #'typst-canvas--on-theme-change)))
+
+(defun typst-canvas--on-theme-change (&rest _)
+  "Send the new theme colors of all sessions."
+  (dolist (buffer (buffer-list))
+    (with-current-buffer buffer
+      (when typst-canvas--session
+        (typst-canvas--request nil)))))
 
 (defun typst-canvas--on-notify (source)
   "Show the newest result of the session of SOURCE."
@@ -249,7 +295,8 @@ DIAGNOSTIC is an element of `typst-canvas--session-diagnostics'."
   "-" #'typst-canvas-zoom-out
   "0" #'typst-canvas-zoom-fit
   "n" #'typst-canvas-next-page
-  "p" #'typst-canvas-previous-page)
+  "p" #'typst-canvas-previous-page
+  "t" #'typst-canvas-toggle-theme)
 
 (define-derived-mode typst-canvas-preview-mode special-mode "Typst-Canvas"
   "Major mode for the preview of a Typst buffer.
@@ -390,6 +437,14 @@ Each page is one canvas image on its own line."
   "Fit the page width to the window."
   (interactive nil typst-canvas-preview-mode)
   (typst-canvas--set-zoom 1.0))
+
+(defun typst-canvas-toggle-theme ()
+  "Toggle whether the pages of this preview have the colors of the theme.
+See `typst-canvas-match-theme'."
+  (interactive nil typst-canvas-preview-mode)
+  (setq-local typst-canvas-match-theme (not typst-canvas-match-theme))
+  (typst-canvas--request-view)
+  (message "Theme colors %s" (if typst-canvas-match-theme "on" "off")))
 
 (defun typst-canvas--current-page ()
   "Return the index of the page at point."
