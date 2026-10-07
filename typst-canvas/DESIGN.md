@@ -18,7 +18,7 @@ Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates:
 | Backward sync | `mouse-1` on a page: `typst_ide::jump_from_click` → move point in the source window and pulse the region. Links open with `browse-url`; internal links scroll the preview. |
 | Forward sync | Point movement in the source (debounced): `typst_ide::jump_from_cursor` → draw a caret + line highlight in the page pixels, scroll the preview to keep it visible. |
 | Theme | Optional: page fill = `default` face background, text fill = foreground, set via `Library` styles (no source rewriting, so spans stay valid). Toggle with `t`. |
-| Look | Each canvas = page + margin in the desk color + soft drop shadow, drawn in Rust. The canvas is at least as wide as the window, with the page centered. Desk color: `default` face background, darkened 8% if light, so that white pages stand out. |
+| Look | Each canvas = page + margin in the desk color + 1-pixel border + soft drop shadow, drawn in Rust. Border and shadow get stronger on a dark desk (white-ish border, more opaque shadow). The canvas is at least as wide as the window, with the page centered. Desk color: `default` face background, darkened 8% if light, so that white pages stand out. |
 | Stats | Preview header line: status, page count, compile ms, render ms, zoom. |
 
 ## Rust (`src/`)
