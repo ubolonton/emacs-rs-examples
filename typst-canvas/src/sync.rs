@@ -217,25 +217,20 @@ impl IdeWorld for Snapshot<'_> {
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use typst::layout::Abs;
 
     use super::*;
+    use crate::testing::{self, TestResult};
 
     const PAGE: &str = "#set page(width: 100pt, height: 100pt, margin: 10pt)\n";
 
-    fn compile(text: &str) -> (PreviewWorld, Document) {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let Ok(mut world) = PreviewWorld::new(root, &root.join("main.typ")) else {
-            panic!("main.typ is inside its root");
-        };
-        world.set_main_text(text);
+    fn compile(text: &str) -> TestResult<(PreviewWorld, Document)> {
+        let world = testing::world(text)?;
         let compiled = world.compile();
-        let Some(document) = compiled.document else {
-            panic!("{:?}", compiled.diagnostics);
-        };
-        (world, document)
+        let document = compiled
+            .document
+            .ok_or_else(|| format!("{:?}", compiled.diagnostics))?;
+        Ok((world, document))
     }
 
     /// A point in the first line of text, at X points from the left page edge.
@@ -249,12 +244,11 @@ mod tests {
     }
 
     #[test]
-    fn caret_follows_cursor_within_text() {
+    fn caret_follows_cursor_within_text() -> TestResult {
         let text = format!("{PAGE}Hello world");
-        let (_, document) = compile(&text);
-        let Some(start) = caret_at(&document, &text, "Hello", 0) else {
-            panic!("no caret at the start of the text");
-        };
+        let (_, document) = compile(&text)?;
+        let start =
+            caret_at(&document, &text, "Hello", 0).ok_or("no caret at the start of the text")?;
         assert_eq!(start.page, 0);
         assert_eq!(start.size, Abs::pt(11.0));
         assert!((start.point.x - Abs::pt(10.0)).abs() < Abs::pt(0.01));
@@ -265,61 +259,63 @@ mod tests {
         assert_eq!(xs.len(), "Hello world".len());
         assert!(xs.windows(2).all(|pair| pair[0] < pair[1]), "{xs:?}");
         assert!(xs[0] > start.point.x);
+        Ok(())
     }
 
     #[test]
-    fn caret_moves_past_math_letters() {
+    fn caret_moves_past_math_letters() -> TestResult {
         let text = format!("{PAGE}$x^2 + alpha$");
-        let (_, document) = compile(&text);
+        let (_, document) = compile(&text)?;
         let x = |needle: &str, shift: usize| {
-            caret_at(&document, &text, needle, shift).map(|caret| caret.point.x.to_pt())
+            caret_at(&document, &text, needle, shift)
+                .map(|caret| caret.point.x.to_pt())
+                .ok_or(format!("no caret at {needle:?} + {shift}"))
         };
         // Math shapes "x" as "𝑥", whose UTF-8 is longer than the source.
-        let (Some(before), Some(after)) = (x("x^2", 0), x("x^2", 1)) else {
-            panic!("no caret at x");
-        };
+        let (before, after) = (x("x^2", 0)?, x("x^2", 1)?);
         assert!(after > before + 3.0, "{before} {after}");
         // Identifiers too: before their glyph while in their name, and after it at its end.
-        let (Some(start), Some(middle), Some(end)) = (x("alpha", 0), x("alpha", 3), x("alpha", 5))
-        else {
-            panic!("no caret in alpha");
-        };
+        let (start, middle, end) = (x("alpha", 0)?, x("alpha", 3)?, x("alpha", 5)?);
         assert!(start <= middle && middle < end, "{start} {middle} {end}");
+        Ok(())
     }
 
     #[test]
-    fn caret_finds_page() {
+    fn caret_finds_page() -> TestResult {
         let text = format!("{PAGE}A\n#pagebreak()\nB");
-        let (_, document) = compile(&text);
+        let (_, document) = compile(&text)?;
         assert_eq!(
             caret_at(&document, &text, "B", 0).map(|caret| caret.page),
             Some(1)
         );
+        Ok(())
     }
 
     #[test]
-    fn caret_is_hidden_outside_text() {
+    fn caret_is_hidden_outside_text() -> TestResult {
         let text = format!("{PAGE}Hello");
-        let (_, document) = compile(&text);
+        let (_, document) = compile(&text)?;
         assert_eq!(caret_at(&document, &text, "page", 0), None);
+        Ok(())
     }
 
     #[test]
-    fn click_on_text_jumps_to_char() {
+    fn click_on_text_jumps_to_char() -> TestResult {
         let text = format!("{PAGE}é Hello");
-        let (world, document) = compile(&text);
+        let (world, document) = compile(&text)?;
         // Right after the left margin: before "é".
         let target = jump(&world, &document, 0, first_line(10.5));
         let start = text.chars().count() - "é Hello".chars().count();
         assert_eq!(target, Some(Target::Main(start)));
         assert_eq!(jump(&world, &document, 0, first_line(95.0)), None);
         assert_eq!(jump(&world, &document, 1, first_line(10.5)), None);
+        Ok(())
     }
 
     #[test]
-    fn click_uses_text_of_document_after_failed_compile() {
+    fn click_uses_text_of_document_after_failed_compile() -> TestResult {
         let text = format!("{PAGE}Hello");
-        let (mut world, document) = compile(&text);
+        let (mut world, document) = compile(&text)?;
         world.set_main_text(&format!("#nope\n{text}"));
         assert!(world.compile().document.is_none());
         let start = text.chars().count() - "Hello".chars().count();
@@ -327,31 +323,41 @@ mod tests {
             jump(&world, &document, 0, first_line(10.5)),
             Some(Target::Main(start))
         );
+        Ok(())
     }
 
     #[test]
-    fn click_on_link_jumps_to_destination() {
+    fn click_on_link_jumps_to_destination() -> TestResult {
         let text = format!(
             "{PAGE}#link(\"https://typst.app\")[Web] #link(<there>)[Here]\n#pagebreak()\n= There <there>"
         );
-        let (world, document) = compile(&text);
+        let (world, document) = compile(&text)?;
         assert_eq!(
             jump(&world, &document, 0, first_line(11.0)),
             Some(Target::Url("https://typst.app".into()))
         );
-        let Some(Target::Position(page, _)) = jump(&world, &document, 0, first_line(35.0)) else {
-            panic!("expected a position");
-        };
-        assert_eq!(page, 1);
+        assert!(
+            matches!(
+                jump(&world, &document, 0, first_line(35.0)),
+                Some(Target::Position(1, _))
+            ),
+            "expected a position on page 2"
+        );
+        Ok(())
     }
 
     #[test]
-    fn click_on_included_text_jumps_to_its_file() {
-        let (world, document) = compile(&format!("{PAGE}#include \"tests/fixtures/included.typ\""));
-        let Some(Target::File(path, char)) = jump(&world, &document, 0, first_line(10.5)) else {
-            panic!("expected another file");
-        };
-        assert!(path.ends_with("tests/fixtures/included.typ"), "{path:?}");
-        assert_eq!(char, 0);
+    fn click_on_included_text_jumps_to_its_file() -> TestResult {
+        let (world, document) =
+            compile(&format!("{PAGE}#include \"tests/fixtures/included.typ\""))?;
+        let target = jump(&world, &document, 0, first_line(10.5));
+        assert!(
+            matches!(
+                &target,
+                Some(Target::File(path, 0)) if path.ends_with("tests/fixtures/included.typ")
+            ),
+            "{target:?}"
+        );
+        Ok(())
     }
 }

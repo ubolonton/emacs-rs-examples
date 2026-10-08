@@ -9,6 +9,8 @@ mod offset;
 mod render;
 mod session;
 mod sync;
+#[cfg(test)]
+mod testing;
 mod world;
 
 use std::path::Path;

@@ -277,56 +277,40 @@ pub fn render(
 
 #[cfg(test)]
 mod tests {
-    use std::path::Path;
-
     use super::*;
-    use crate::world::{Document, PreviewWorld};
+    use crate::testing::{TestResult, compile, find};
 
     const PAGE: &str = "#set page(width: 200pt, height: 100pt, margin: 10pt)\n";
 
-    fn compile(text: &str) -> Document {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let Ok(mut world) = PreviewWorld::new(root, &root.join("main.typ")) else {
-            panic!("main.typ is inside its root");
-        };
-        world.set_main_text(text);
-        let compiled = world.compile();
-        let Some(document) = compiled.document else {
-            panic!("{:?}", compiled.diagnostics);
-        };
-        document
-    }
-
     /// Return the cut-out of the equation at the first occurrence of NEEDLE in TEXT.
-    fn cutout_at(text: &str, needle: &str) -> Option<Cutout> {
-        let document = compile(text);
-        let node = equation_at(&document.source, text.find(needle)?)?;
-        cut_out(&document.paged, node.span())
+    fn cutout_at(text: &str, needle: &str) -> TestResult<Cutout> {
+        let document = compile(text)?;
+        let node = equation_at(&document.source, find(text, needle)?).ok_or("no equation")?;
+        Ok(cut_out(&document.paged, node.span()).ok_or("no cut-out")?)
     }
 
     #[test]
-    fn equation_at_needs_cursor_inside_delimiters() {
+    fn equation_at_needs_cursor_inside_delimiters() -> TestResult {
         let source = Source::detached("A $x + y$ B\n$ z $");
         let text = source.text();
         let found = |cursor: usize| {
             equation_at(&source, cursor).map(|node| node.offset()..node.offset() + node.len())
         };
         let inline = text.find('$').map(|start| start..start + "$x + y$".len());
-        assert_eq!(found(text.find('x').unwrap_or_default()), inline);
-        assert_eq!(found(text.find(" y").unwrap_or_default() + 2), inline);
+        assert_eq!(found(find(text, "x")?), inline);
+        assert_eq!(found(find(text, " y")? + 2), inline);
         // On the delimiters' outer sides, the cursor is outside.
-        assert_eq!(found(text.find('$').unwrap_or_default()), None);
-        assert_eq!(found(text.find(" B").unwrap_or_default()), None);
-        assert!(found(text.find('z').unwrap_or_default()).is_some());
+        assert_eq!(found(find(text, "$")?), None);
+        assert_eq!(found(find(text, " B")?), None);
+        assert!(found(find(text, "z")?).is_some());
         assert_eq!(found(0), None);
+        Ok(())
     }
 
     #[test]
-    fn cut_out_bounds_inline_equation() {
+    fn cut_out_bounds_inline_equation() -> TestResult {
         let text = format!("{PAGE}Before $x^2 + y^2$ after.");
-        let Some(cutout) = cutout_at(&text, "x^2") else {
-            panic!("no cut-out");
-        };
+        let cutout = cutout_at(&text, "x^2")?;
         assert_eq!(cutout.page, 0);
         assert_eq!(cutout.size, Abs::pt(11.0));
         // The equation is in the first line, after "Before ", and narrower than the line.
@@ -334,46 +318,39 @@ mod tests {
         assert!(cutout.bounds.min.x > Abs::pt(30.0), "{cutout:?}");
         assert!(width > Abs::pt(20.0) && width < Abs::pt(90.0), "{cutout:?}");
         assert!(cutout.bounds.max.y < Abs::pt(30.0), "{cutout:?}");
+        Ok(())
     }
 
     #[test]
-    fn cut_out_includes_content_from_let_bindings() {
-        let literal = cutout_at(&format!("{PAGE}$x + y$"), "x");
-        let bound = cutout_at(&format!("{PAGE}#let y = $y$\n$x + y$"), "x +");
-        let width = |cutout: Option<Cutout>| {
-            cutout.map(|cutout| (cutout.bounds.max.x - cutout.bounds.min.x).to_pt())
-        };
-        let (Some(literal), Some(bound)) = (width(literal), width(bound)) else {
-            panic!("no cut-out");
-        };
+    fn cut_out_includes_content_from_let_bindings() -> TestResult {
+        let width = |cutout: Cutout| (cutout.bounds.max.x - cutout.bounds.min.x).to_pt();
+        let literal = width(cutout_at(&format!("{PAGE}$x + y$"), "x")?);
+        let bound = width(cutout_at(&format!("{PAGE}#let y = $y$\n$x + y$"), "x +")?);
         assert!((literal - bound).abs() < 0.01, "{literal} vs {bound}");
+        Ok(())
     }
 
     #[test]
-    fn cut_out_finds_display_equation_on_later_page() {
+    fn cut_out_finds_display_equation_on_later_page() -> TestResult {
         let text = format!("{PAGE}A\n#pagebreak()\n$ sum_(n=1)^oo 1/n^2 $");
-        let Some(cutout) = cutout_at(&text, "sum") else {
-            panic!("no cut-out");
-        };
+        let cutout = cutout_at(&text, "sum")?;
         assert_eq!(cutout.page, 1);
         // The big operator and its limits are taller than a line.
         assert!(cutout.bounds.max.y - cutout.bounds.min.y > Abs::pt(20.0));
+        Ok(())
     }
 
     #[test]
     fn cut_out_skips_empty_equation() {
-        assert!(cutout_at(&format!("{PAGE}A $$ B"), "$$").is_none());
+        assert!(cutout_at(&format!("{PAGE}A $$ B"), "$$").is_err());
     }
 
     #[test]
-    fn render_scales_to_text_size_and_width_limit() {
+    fn render_scales_to_text_size_and_width_limit() -> TestResult {
         let text = format!("{PAGE}$x + y$");
-        let document = compile(&text);
-        let Some(cutout) = equation_at(&document.source, text.rfind('x').unwrap_or_default())
-            .and_then(|node| cut_out(&document.paged, node.span()))
-        else {
-            panic!("no cut-out");
-        };
+        let document = compile(&text)?;
+        let node = equation_at(&document.source, find(&text, "x +")?).ok_or("no equation")?;
+        let cutout = cut_out(&document.paged, node.span()).ok_or("no cut-out")?;
         let page = &document.paged.pages()[0];
         let view = |px_per_em, max_width| EquationView {
             px_per_em,
@@ -391,5 +368,6 @@ mod tests {
         assert!(darkest(&small.pixels) < Some(0x40));
         // Dimming lightens the text towards the white background.
         assert!(darkest(&small.dimmed()) > Some(0x80));
+        Ok(())
     }
 }

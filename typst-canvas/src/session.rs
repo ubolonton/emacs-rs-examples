@@ -14,7 +14,7 @@ use std::{
     time::Instant,
 };
 
-use typst::{diag::Severity, layout::Point, syntax::Source};
+use typst::{comemo, diag::Severity, layout::Point, syntax::Source};
 
 use crate::{
     math::{self, EquationImage, EquationView},
@@ -320,7 +320,7 @@ impl Shared {
                  document,
                  diagnostics,
              }| {
-                typst::comemo::evict(EVICTION_AGE);
+                comemo::evict(EVICTION_AGE);
                 (document.map(Arc::new), diagnostics, elapsed_ms(start))
             },
         );
@@ -384,6 +384,7 @@ mod tests {
     };
 
     use super::*;
+    use crate::testing::{TestResult, find};
 
     const TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -402,16 +403,12 @@ mod tests {
         }
     }
 
-    fn start() -> (Session, Receiver<u8>) {
+    fn start() -> TestResult<(Session, Receiver<u8>)> {
         let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let Ok(world) = PreviewWorld::new(root, &root.join("main.typ")) else {
-            panic!("main.typ is inside its root");
-        };
+        let world = PreviewWorld::new(root, &root.join("main.typ"))?;
         let (sender, receiver) = mpsc::channel();
-        let Ok(session) = Session::start(world, ChannelWriter(sender)) else {
-            panic!("cannot spawn the session thread");
-        };
-        (session, receiver)
+        let session = Session::start(world, ChannelWriter(sender))?;
+        Ok((session, receiver))
     }
 
     /// Wait for notifications until SESSION served request ID.
@@ -433,8 +430,8 @@ mod tests {
     }
 
     #[test]
-    fn renders_pages_and_keeps_last_good_document() {
-        let (session, notifications) = start();
+    fn renders_pages_and_keeps_last_good_document() -> TestResult {
+        let (session, notifications) = start()?;
         let text = Some("#set page(width: 100pt, height: 50pt)\nA\n#pagebreak()\nB".into());
         let id = session.request(Request {
             text,
@@ -467,11 +464,12 @@ mod tests {
             Arc::ptr_eq(&output.pages[1], &first_pages[1]),
             "page re-rendered"
         );
+        Ok(())
     }
 
     #[test]
-    fn view_requests_keep_pending_text() {
-        let (session, notifications) = start();
+    fn view_requests_keep_pending_text() -> TestResult {
+        let (session, notifications) = start()?;
         let text = Some("#set page(width: 100pt, height: 50pt)\nA".into());
         session.request(Request {
             text,
@@ -489,11 +487,12 @@ mod tests {
         let output = session.output();
         assert_eq!(output.pages.len(), 1);
         assert_eq!(output.pages[0].width, 300);
+        Ok(())
     }
 
     #[test]
-    fn theme_change_compiles_again() {
-        let (session, notifications) = start();
+    fn theme_change_compiles_again() -> TestResult {
+        let (session, notifications) = start()?;
         let text = Some("#set page(width: 100pt, height: 50pt)".into());
         let id = session.request(Request {
             text,
@@ -519,11 +518,12 @@ mod tests {
             image.pixels[image.height / 2 * image.width + image.width / 2],
             0xFF00_0000
         );
+        Ok(())
     }
 
     #[test]
-    fn slide_fits_page_into_view() {
-        let (session, notifications) = start();
+    fn slide_fits_page_into_view() -> TestResult {
+        let (session, notifications) = start()?;
         let text = Some("#set page(width: 160pt, height: 90pt)\nA\n#pagebreak()\nB".into());
         let slide = |page| SlideView {
             page,
@@ -539,9 +539,7 @@ mod tests {
         wait_for(&session, &notifications, id);
         let first = {
             let output = session.output();
-            let Some(image) = output.slide.clone() else {
-                panic!("no slide");
-            };
+            let image = output.slide.clone().ok_or("no slide")?;
             // The image fills the view. The page fits its width, centered vertically on black.
             assert_eq!((image.width, image.height), (400, 300));
             assert_eq!((image.page.width, image.page.height), (400, 225));
@@ -572,11 +570,12 @@ mod tests {
         });
         wait_for(&session, &notifications, id);
         assert!(session.output().slide.is_none());
+        Ok(())
     }
 
     #[test]
-    fn equation_goes_stale_while_text_fails() {
-        let (session, notifications) = start();
+    fn equation_goes_stale_while_text_fails() -> TestResult {
+        let (session, notifications) = start()?;
         let equation_view = EquationView {
             px_per_em: 16.0,
             max_width: 500,
@@ -592,27 +591,28 @@ mod tests {
         };
         let good = "#set page(width: 100pt, height: 50pt)\nA $x + y$ B";
         serve(good);
-        let cursor = good.find('x').unwrap_or_default();
-        let Some(fresh) = session.equation(cursor, equation_view) else {
-            panic!("no equation");
-        };
+        let cursor = find(good, "x")?;
+        let fresh = session
+            .equation(cursor, equation_view)
+            .ok_or("no equation")?;
         assert!(!fresh.stale);
-        assert_eq!(fresh.end, good.find(" B").unwrap_or_default());
+        assert_eq!(fresh.end, find(good, " B")?);
         // Outside the equation, there is none.
         assert!(session.equation(good.len(), equation_view).is_none());
         session.equation(cursor, equation_view);
         // An error inside the equation keeps the last image, as stale.
         serve("#set page(width: 100pt, height: 50pt)\nA $x + #nope$ B");
-        let Some(stale) = session.equation(cursor, equation_view) else {
-            panic!("no stale equation");
-        };
+        let stale = session
+            .equation(cursor, equation_view)
+            .ok_or("no stale equation")?;
         assert!(stale.stale);
         assert_eq!(stale.end, fresh.end + "#nope".len() - "y".len());
+        Ok(())
     }
 
     #[test]
-    fn stop_joins_thread() {
-        let (mut session, notifications) = start();
+    fn stop_joins_thread() -> TestResult {
+        let (mut session, notifications) = start()?;
         session.request(Request {
             text: Some("A".into()),
             theme: None,
@@ -627,5 +627,6 @@ mod tests {
             notifications.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
         ));
+        Ok(())
     }
 }

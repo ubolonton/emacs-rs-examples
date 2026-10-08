@@ -1,6 +1,8 @@
 //! The Typst world of a preview: the buffer text is the main file, everything else comes from disk.
 
 use std::{
+    error::Error,
+    fmt,
     ops::Range,
     path::{Path, PathBuf},
     sync::{Arc, LazyLock},
@@ -76,6 +78,14 @@ pub struct Document {
 
 #[derive(Debug)]
 pub struct MainOutsideRoot;
+
+impl fmt::Display for MainOutsideRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the main file is not in the project root")
+    }
+}
+
+impl Error for MainOutsideRoot {}
 
 /// Default page and text colors, as `0xRRGGBB`. Documents can still set their own.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -270,19 +280,11 @@ impl IdeWorld for PreviewWorld {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn world(text: &str) -> PreviewWorld {
-        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
-        let Ok(mut world) = PreviewWorld::new(root, &root.join("main.typ")) else {
-            panic!("main.typ is inside its root");
-        };
-        world.set_main_text(text);
-        world
-    }
+    use crate::testing::{TestResult, find, world};
 
     #[test]
-    fn compiles_pages() {
-        let compiled = world("A\n#pagebreak()\nB").compile();
+    fn compiles_pages() -> TestResult {
+        let compiled = world("A\n#pagebreak()\nB")?.compile();
         assert_eq!(compiled.diagnostics, []);
         assert_eq!(
             compiled
@@ -290,16 +292,16 @@ mod tests {
                 .map(|document| document.paged.pages().len()),
             Some(2)
         );
+        Ok(())
     }
 
     #[test]
-    fn locates_errors_in_chars() {
+    fn locates_errors_in_chars() -> TestResult {
         // "é" is 2 bytes in UTF-8, but 1 char in Emacs.
-        let compiled = world("é #nope").compile();
+        let compiled = world("é #nope")?.compile();
         assert!(compiled.document.is_none());
-        let [diagnostic] = compiled.diagnostics.as_slice() else {
-            panic!("expected 1 diagnostic, got {:?}", compiled.diagnostics);
-        };
+        assert_eq!(compiled.diagnostics.len(), 1, "{:?}", compiled.diagnostics);
+        let diagnostic = &compiled.diagnostics[0];
         assert_eq!(diagnostic.severity, Severity::Error);
         assert_eq!(diagnostic.chars, 3..7);
         assert!(
@@ -307,16 +309,16 @@ mod tests {
             "{}",
             diagnostic.message
         );
+        Ok(())
     }
 
     #[test]
-    fn locates_errors_in_other_files_at_main_call_site() {
+    fn locates_errors_in_other_files_at_main_call_site() -> TestResult {
         let text = "#import \"tests/fixtures/broken.typ\": f\n#f()";
-        let compiled = world(text).compile();
-        let [diagnostic] = compiled.diagnostics.as_slice() else {
-            panic!("expected 1 diagnostic, got {:?}", compiled.diagnostics);
-        };
-        let call = text.find("f()").unwrap_or_default();
+        let compiled = world(text)?.compile();
+        assert_eq!(compiled.diagnostics.len(), 1, "{:?}", compiled.diagnostics);
+        let diagnostic = &compiled.diagnostics[0];
+        let call = find(text, "f()")?;
         assert_eq!(diagnostic.chars, call..call + "f()".len());
         assert!(
             diagnostic
@@ -325,11 +327,12 @@ mod tests {
             "{}",
             diagnostic.message
         );
+        Ok(())
     }
 
     #[test]
-    fn theme_sets_default_colors() {
-        let mut world = world("#rect(width: 1pt, height: 1pt)");
+    fn theme_sets_default_colors() -> TestResult {
+        let mut world = world("#rect(width: 1pt, height: 1pt)")?;
         assert!(world.set_theme(Some(Theme {
             page: 0x10_2030,
             text: 0xF0_E0D0,
@@ -339,9 +342,9 @@ mod tests {
             text: 0xF0_E0D0,
         })));
         let compiled = world.compile();
-        let Some(document) = compiled.document else {
-            panic!("{:?}", compiled.diagnostics);
-        };
+        let document = compiled
+            .document
+            .ok_or_else(|| format!("{:?}", compiled.diagnostics))?;
         let page = &document.paged.pages()[0];
         assert_eq!(
             page.fill,
@@ -355,6 +358,7 @@ mod tests {
                 .map(|document| document.paged.pages()[0].fill.clone()),
             Some(Smart::Auto)
         );
+        Ok(())
     }
 
     #[test]
