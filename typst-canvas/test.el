@@ -404,6 +404,80 @@ Return the status."
                            (if indirect 3 2)))))
         (typst-canvas-mode -1)))))
 
+(ert-deftest typst-canvas::sessions-of-buffers-are-independent ()
+  (let ((first (generate-new-buffer "typst-canvas-test-1"))
+        (second (generate-new-buffer "typst-canvas-test-2")))
+    (unwind-protect
+        (progn
+          (with-current-buffer first
+            (insert typst-canvas-test--page "A")
+            (typst-canvas-mode 1))
+          (with-current-buffer second
+            (insert typst-canvas-test--page "A\n#pagebreak()\nB")
+            (typst-canvas-mode 1))
+          (should-not (eq (buffer-local-value 'typst-canvas--preview first)
+                          (buffer-local-value 'typst-canvas--preview second)))
+          (with-current-buffer first
+            (typst-canvas-test--settle)
+            (should (= (nth 1 typst-canvas--status) 1))
+            (goto-char (point-max))
+            (insert "\n#pagebreak()\nB\n#pagebreak()\nC")
+            (typst-canvas-test--settle)
+            (should (= (nth 1 typst-canvas--status) 3)))
+          (with-current-buffer second
+            (typst-canvas-test--settle)
+            (should (= (nth 1 typst-canvas--status) 2)))
+          ;; Killing one buffer keeps the session of the other, and the theme hooks.
+          (kill-buffer first)
+          (should (memq #'typst-canvas--on-theme-change enable-theme-functions))
+          (with-current-buffer second
+            (goto-char (point-max))
+            (insert "\n#pagebreak()\nC")
+            (typst-canvas-test--settle)
+            (should (= (nth 1 typst-canvas--status) 3)))
+          (kill-buffer second)
+          (should-not (memq #'typst-canvas--on-theme-change enable-theme-functions)))
+      (dolist (buffer (list first second))
+        (when (buffer-live-p buffer)
+          (kill-buffer buffer))))))
+
+(ert-deftest typst-canvas::narrowing-keeps-whole-document ()
+  (with-temp-buffer
+    (insert typst-canvas-test--jump-page "Hello world\n#pagebreak()\nSecond page")
+    (typst-canvas-mode 1)
+    (unwind-protect
+        (let ((preview typst-canvas--preview)
+              (session typst-canvas--session))
+          (typst-canvas-test--settle)
+          (goto-char (point-min))
+          (search-forward "Hello")
+          (narrow-to-region (line-beginning-position) (line-end-position))
+          ;; Edits in the region send the whole text.
+          (goto-char (point-max))
+          (insert "!")
+          (typst-canvas-test--settle)
+          (should (= (nth 1 typst-canvas--status) 2))
+          ;; A diagnostic after the region stays where it is.
+          (save-restriction
+            (widen)
+            (goto-char (point-max))
+            (insert "\n#nope"))
+          (typst-canvas-test--settle)
+          (let ((diagnostic (typst-canvas--make-diagnostic
+                             (car (typst-canvas--session-diagnostics session)))))
+            (should (equal (save-restriction
+                             (widen)
+                             (buffer-substring (flymake-diagnostic-beg diagnostic)
+                                               (flymake-diagnostic-end diagnostic)))
+                           "nope")))
+          ;; A jump to text after the region widens.
+          (with-current-buffer preview
+            (pcase-let ((`(,x . ,y) (typst-canvas-test--pixel session 1 11 15)))
+              (should (typst-canvas--jump 1 x y))))
+          (should-not (buffer-narrowed-p))
+          (should (equal (thing-at-point 'word) "Second")))
+      (typst-canvas-mode -1))))
+
 ;;;; Backward sync
 
 (defconst typst-canvas-test--jump-page

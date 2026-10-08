@@ -485,9 +485,11 @@ they arrive."
   "Make a Flymake diagnostic from DIAGNOSTIC.
 DIAGNOSTIC is an element of `typst-canvas--session-diagnostics'."
   (pcase-let* ((`(,beg ,end ,severity ,message) diagnostic)
-               ;; The buffer can be shorter than the compiled text, if it changed since then.
-               (beg (min beg (point-max)))
-               (end (min (max end (1+ beg)) (point-max))))
+               ;; The buffer can be shorter than the text sent, if it changed since then.  Not
+               ;; `point-max': the diagnostic can be outside the narrowed region.
+               (last (1+ (buffer-size)))
+               (beg (min beg last))
+               (end (min (max end (1+ beg)) last)))
     (flymake-make-diagnostic (current-buffer) beg end severity message)))
 
 ;;;; Preview buffer
@@ -799,9 +801,12 @@ Call it only when all buffer changes are sent: see `typst-canvas--update-caret'.
                           (list 'image :type 'canvas
                                 :id (make-symbol "typst-canvas-equation")
                                 :data-width 1 :data-height 1))))
+        ;; The end can be outside the narrowed region.
         (eol (save-excursion
-               (goto-char end)
-               (line-end-position))))
+               (save-restriction
+                 (widen)
+                 (goto-char end)
+                 (line-end-position)))))
     (plist-put (cdr canvas) :data-width width)
     (plist-put (cdr canvas) :data-height height)
     (when (typst-canvas--present-equation typst-canvas--session canvas)
@@ -883,7 +888,7 @@ If QUIET is nil, say when there was none."
        t)
       (`(file ,path ,position)
        (find-file-other-window path)
-       (goto-char (min position (point-max)))
+       (typst-canvas--goto position)
        (typst-canvas--pulse)
        t)
       (`(url ,url)
@@ -902,8 +907,15 @@ If QUIET is nil, say when there was none."
   "Select a window with the source buffer, go to POSITION, and pulse it."
   (let ((source typst-canvas--source))
     (select-window (or (get-buffer-window source) (display-buffer source)))
-    (goto-char (min position (point-max)))
+    (typst-canvas--goto position)
     (typst-canvas--pulse)))
+
+(defun typst-canvas--goto (position)
+  "Go to POSITION.  Widen the buffer if POSITION is outside its narrowed region."
+  (let ((position (min position (1+ (buffer-size)))))
+    (unless (<= (point-min) position (point-max))
+      (widen))
+    (goto-char position)))
 
 (defun typst-canvas--pulse ()
   "Briefly highlight the word at point, or the line if there is no word."
