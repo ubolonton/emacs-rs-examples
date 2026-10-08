@@ -24,7 +24,8 @@ typst-kit = { version = "0.15", features = [
 [lib]
 crate-type = ["cdylib"]
 
-# Typst is too slow for live use without optimizations. Optimize dependencies, but keep this crate
-# fast to rebuild.
-[profile.dev.package."*"]
+# Typst is too slow for live use without optimizations, and so are this crate's per-pixel loops:
+# bin/latency.sh showed 110 ms per page at opt-level 0, and 5 ms at opt-level 2. A rebuild of this
+# crate alone takes about as long either way.
+[profile.dev]
 opt-level = 2

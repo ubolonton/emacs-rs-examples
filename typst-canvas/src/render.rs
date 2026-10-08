@@ -3,11 +3,14 @@
 
 use std::{
     collections::HashMap,
+    num::NonZeroUsize,
     ops::Range,
+    panic,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
     },
+    thread,
 };
 
 use typst::{
@@ -109,31 +112,79 @@ impl PageImage {
 }
 
 /// Render the pages of DOCUMENT for VIEW. Reuse the images in PREVIOUS that would not change, even
-/// if their pages moved (e.g. after a page was inserted before them).
+/// if their pages moved (e.g. after a page was inserted before them). Render the other pages in
+/// parallel.
 pub fn render_pages(
     document: &PagedDocument,
     view: View,
     previous: &[Arc<PageImage>],
 ) -> Vec<Arc<PageImage>> {
-    let pixel_per_pt = pixel_per_pt(document.pages(), view);
+    let pages = document.pages();
+    let pixel_per_pt = pixel_per_pt(pages, view);
     let reusable: HashMap<Key, &Arc<PageImage>> =
         previous.iter().map(|image| (image.key, image)).collect();
-    document
-        .pages()
+    let keys: Vec<Key> = pages
         .iter()
-        .map(|page| {
-            let key = Key {
-                page: hash128(page),
-                pixel_per_pt: pixel_per_pt.to_bits(),
-                width: view.width,
-                desk: view.desk,
-            };
-            match reusable.get(&key) {
-                Some(image) => Arc::clone(image),
-                None => Arc::new(render_page(page, pixel_per_pt, view, key)),
-            }
+        .map(|page| Key {
+            page: hash128(page),
+            pixel_per_pt: pixel_per_pt.to_bits(),
+            width: view.width,
+            desk: view.desk,
         })
-        .collect()
+        .collect();
+    let mut images: Vec<Option<Arc<PageImage>>> = keys
+        .iter()
+        .map(|key| reusable.get(key).map(|image| Arc::clone(image)))
+        .collect();
+    let missing: Vec<usize> = (0..pages.len())
+        .filter(|&index| images[index].is_none())
+        .collect();
+    let render = |index: usize| render_page(&pages[index], pixel_per_pt, view, keys[index]);
+    for (index, image) in render_in_parallel(&missing, render) {
+        images[index] = Some(Arc::new(image));
+    }
+    images.into_iter().flatten().collect()
+}
+
+/// Call RENDER on each of INDICES, on up to one thread per core. Return the results with their
+/// indices. A panic in a render thread resumes on the calling thread.
+fn render_in_parallel<F>(indices: &[usize], render: F) -> Vec<(usize, PageImage)>
+where
+    F: Fn(usize) -> PageImage + Sync,
+{
+    let threads = thread::available_parallelism()
+        .map_or(1, NonZeroUsize::get)
+        .min(indices.len());
+    if threads <= 1 {
+        return indices
+            .iter()
+            .map(|&index| (index, render(index)))
+            .collect();
+    }
+    thread::scope(|scope| {
+        let render = &render;
+        // Thread N renders every Nth page, so that pages of similar cost spread out.
+        let handles: Vec<_> = (0..threads)
+            .map(|thread| {
+                scope.spawn(move || {
+                    indices
+                        .iter()
+                        .skip(thread)
+                        .step_by(threads)
+                        .map(|&index| (index, render(index)))
+                        .collect::<Vec<_>>()
+                })
+            })
+            .collect();
+        handles
+            .into_iter()
+            .flat_map(|handle| {
+                handle
+                    .join()
+                    .unwrap_or_else(|panic| panic::resume_unwind(panic))
+            })
+            .collect()
+    })
 }
 
 /// Return the scale at which the widest page fits the view width, times the zoom.
@@ -242,12 +293,6 @@ pub struct Rect {
     pub height: usize,
 }
 
-impl Rect {
-    fn contains(self, x: usize, y: usize) -> bool {
-        (self.x..self.x + self.width).contains(&x) && (self.y..self.y + self.height).contains(&y)
-    }
-}
-
 /// Draw a drop shadow and a 1-pixel border around PAGE, onto the desk-colored PIXELS, whose rows
 /// are WIDTH long. The page area itself is left alone.
 fn decorate(pixels: &mut [u32], width: usize, page: Rect, desk: u32) {
@@ -266,10 +311,13 @@ fn decorate(pixels: &mut [u32], width: usize, page: Rect, desk: u32) {
         page.y.saturating_sub(reach)..(page.y + page.height + SHADOW_OFFSET + reach).min(height);
     let columns = page.x.saturating_sub(reach)..(page.x + page.width + reach).min(width);
     for y in rows {
-        for x in columns.clone() {
-            if page.contains(x, y) {
-                continue;
-            }
+        // Skip the page area: in its rows, only the strips left and right of it.
+        let spans = if (page.y..page.y + page.height).contains(&y) {
+            [columns.start..page.x, page.x + page.width..columns.end]
+        } else {
+            [columns.clone(), 0..0]
+        };
+        for x in spans.into_iter().flatten() {
             // Distance from the pixel center to the shadow rectangle.
             let (center_x, center_y) = (x as f64 + 0.5, y as f64 + 0.5);
             let dx = (left - center_x).max(center_x - right).max(0.0);
@@ -282,12 +330,13 @@ fn decorate(pixels: &mut [u32], width: usize, page: Rect, desk: u32) {
     let border = mix(if dark { WHITE } else { BLACK }, desk, BORDER_OPACITY);
     let (outer_left, outer_top) = (page.x.saturating_sub(1), page.y.saturating_sub(1));
     let (outer_right, outer_bottom) = (page.x + page.width, page.y + page.height);
-    for y in outer_top..=outer_bottom.min(height - 1) {
-        for x in outer_left..=outer_right.min(width - 1) {
-            if y == outer_top || y == outer_bottom || x == outer_left || x == outer_right {
-                pixels[y * width + x] = border;
-            }
-        }
+    let (outer_right, outer_bottom) = (outer_right.min(width - 1), outer_bottom.min(height - 1));
+    for y in [outer_top, outer_bottom] {
+        pixels[y * width + outer_left..=y * width + outer_right].fill(border);
+    }
+    for y in outer_top..=outer_bottom {
+        pixels[y * width + outer_left] = border;
+        pixels[y * width + outer_right] = border;
     }
 }
 
@@ -413,6 +462,23 @@ mod tests {
         assert_eq!(at(19, baseline - 1), WHITE);
         assert_eq!(at(21, baseline - 25), WHITE);
         assert_eq!(caret_band(&image, &caret), baseline - 19..baseline + 7);
+    }
+
+    #[test]
+    fn render_in_parallel_renders_each_index_once() {
+        let indices = [0, 2, 3, 5, 7, 8, 9, 11, 12, 14];
+        let mut results = render_in_parallel(&indices, |index| PageImage {
+            serial: index as u64,
+            ..blank_image()
+        });
+        results.sort_by_key(|(index, _)| *index);
+        let serials: Vec<(usize, u64)> = results
+            .iter()
+            .map(|(index, image)| (*index, image.serial))
+            .collect();
+        let expected: Vec<(usize, u64)> =
+            indices.iter().map(|&index| (index, index as u64)).collect();
+        assert_eq!(serials, expected);
     }
 
     #[test]

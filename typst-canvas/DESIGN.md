@@ -6,6 +6,9 @@ images (`Value::with_canvas_data`). No external process, no PDF viewer, no brows
 
 Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates: 0.15.x.
 
+The dev profile uses `opt-level = 2` for all crates: Typst and the per-pixel loops in `render.rs`
+are too slow for live use without optimizations.
+
 ## Features
 
 | Area | Behavior |
@@ -41,6 +44,7 @@ Target: `emacs-32-gtk` (GUI build; canvases work in `-batch` too). Typst crates:
 - `render.rs`: `typst_render::render` → premultiplied RGBA → `0xAARRGGBB` composited onto the page, plus margin, shadow, caret.
   - Each `PageImage` has a key (page hash via `typst::utils::hash128(&Page)`, scale, window width, desk color) and a serial. A re-render reuses images with the same key, also if their page moved. Lisp copies a page only if its serial changed.
   - Scale: the widest page fits the window width minus margins, times the zoom. A pixel budget per page caps it.
+  - Pages without a reusable image render in parallel (`thread::scope`, up to one thread per core). A reflow re-renders all later pages.
 - `offset.rs`: UTF-8 byte ↔ Emacs char offset conversion.
 - `sync.rs`: click jumps (`jump_from_click` with a `Snapshot` world whose main file is the document's `Source`), and the caret. `typst_ide::jump_from_cursor` returns only the start of the text node, without a font size, so `sync::caret` does its node lookup and frame walk, but stops at the glyph of the cursor (`Glyph::span.1` is the glyph's byte offset in its node).
   - The caret lives in `Session` (Lisp thread only), in points. `present_page` draws it with the current image's scale.
@@ -63,6 +67,7 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
 
 - `cargo test`: Rust unit tests (offsets, pixel conversion, compile, diagnostics, session thread).
 - `bin/test.sh`: ERT in batch mode (`EMACS=emacs-32-gtk`).
+- `bin/latency.sh`: edit-to-screen latency under Xvfb (`bin/latency.el`), on `examples/showcase.typ`. Prints median, min and max of the total, compile, render, Lisp and redisplay times.
 - `bin/screenshot.sh`: GUI under Xvfb (`bin/screenshot.el`), saves `target/screenshot-{1..5}.png`: light theme with the caret, a compile error (stale pages), `modus-vivendi` loaded at run time, the pulse right after a click jump, zoom + hscroll.
 
 ## Phases
