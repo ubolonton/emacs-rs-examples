@@ -22,6 +22,8 @@ are too slow for live use without optimizations.
 | Forward sync | `typst-canvas-follow-cursor` (default on). Point movement in the source (`post-command-hook`, debounced 0.1 s), and each new result: find the caret (page, point, font size) → draw a bar in the `cursor` face color and a translucent line band onto the canvas at copy time, so cached page images stay clean. Only the old and new caret pages are copied again. If the caret's line is not visible, scroll so that it is 1/3 from the top (`window-start` + pixel vscroll). No caret when point is not in laid-out text (e.g. in code). |
 | Theme | `typst-canvas-match-theme` (default on): page fill = `default` face background, text fill = foreground, set via `Library` styles (no source rewriting, so spans stay valid). Line and table strokes get the text color too; other default strokes stay black. Toggle with `t` (buffer-local in the preview). `enable-theme-functions`/`disable-theme-functions` re-apply it while a session exists. |
 | Look | Each canvas = page + margin in the desk color + 1-pixel border + soft drop shadow, drawn in Rust. Border and shadow get stronger on a dark desk (white-ish border, more opaque shadow). The canvas is at least as wide as the window, with the page centered. Desk color: `default` face background with its HSL lightness shifted 8% (darker if light, lighter if dark), so that pages stand out also when they match the theme. Hex colors are parsed without a frame (`color-values-from-color-spec`), because a text terminal frame rounds them. |
+| Equation at point | `typst-canvas-inline-math` (default on). While point is between the delimiters of an equation (`$...$`, inline or display), an overlay after the end of the equation's last line shows it rendered: an `after-string` of `"\n"` (with `cursor`, so that the cursor stays at the end of the line) and a canvas. Font size: the `default` face's pixel size × `typst-canvas-inline-math-scale` (1.25: math fonts have smaller lowercase letters than code fonts), at most the window width. It shows the caret too. It updates with the caret (debounced point motion, each new result) and disappears when point leaves math. While the newest text does not compile, the last image of the same equation shows dimmed. |
+| Presentation | `typst-canvas-present`: one page at a time, as large as fits the window, centered on black, in a new fullscreen frame (`typst-canvas-present-frame`; else the selected window, alone, with the window configuration restored on quit). No mode line, header line or cursor; black `default` and `fringe` faces. Keys: `SPC`/`n`/right next, `DEL`/`p`/left previous, digits + `RET` go to, `<home>`/`<end>`, `q` quit. Starts at the page of the caret, else the top page of the preview. Live: the slide comes with each result of the source's session. |
 | Stats | Preview header line: status (`success` "ok", `shadow` "compiling", `error` "N errors" + `warning` "stale" when the pages are from the last good compile, `warning` "N warnings"), "p 2/5" (the caret page, else the top page of the window), compile ms and render ms (`shadow`), zoom. |
 
 ## Rust (`src/`)
@@ -36,18 +38,26 @@ are too slow for live use without optimizations.
   - Diagnostics: converted to char ranges in the main file. A diagnostic in another file goes to the innermost main-file call site in its trace, with the file name in the message.
 - `session.rs`: `Session`, owned by Lisp as a `user-ptr`. Drop stops and joins the thread.
   - All shared state is in one `Arc<Shared>`: request slot, world, output.
-  - Request slot: `Mutex<Slot>` + `Condvar`. A request carries the new text (optional), the theme colors (optional), and the view (fit width px, zoom, desk color). A theme change compiles again, also without new text. A new request replaces an unserved one, but keeps its text if it has none. Each request gets an ID.
+  - Request slot: `Mutex<Slot>` + `Condvar`. A request carries the new text (optional), the theme colors (optional), the view (fit width px, zoom, desk color), and the slide view (page, window width and height px; while a presentation shows). A theme change compiles again, also without new text. A new request replaces an unserved one, but keeps its text if it has none. Each request gets an ID.
   - World: `Mutex<PreviewWorld>`; the thread locks it for update + compile. A click jump locks it on the Lisp thread (for other files), so it waits for a running compile.
-  - Output: `Mutex<Output>` with the ID of the newest served request (Lisp compares it with the newest sent ID to show "compiling"), the last good document (`Arc`), rendered pages (`Arc<PageImage>`), diagnostics, compile ms, render ms.
+  - Output: `Mutex<Output>` with the ID of the newest served request (Lisp compares it with the newest sent ID to show "compiling"), the last good document (`Arc`), rendered pages (`Arc<PageImage>`), the slide (`Arc<PageImage>`, if the request asked for one), diagnostics, compile ms, render ms.
+  - Lisp-thread state: the caret, the newest text sent as a parsed `Source` (`Source::replace` reparses incrementally), and the equation image with its stale flag.
   - Notify: after each served request, the thread writes `"\n"` to the pipe. Write errors are ignored.
   - A panic in Typst becomes an error diagnostic. The thread continues.
 - `render.rs`: `typst_render::render` → premultiplied RGBA → `0xAARRGGBB` composited onto the page, plus margin, shadow, caret.
   - Each `PageImage` has a key (page hash via `typst::utils::hash128(&Page)`, scale, window width, desk color) and a serial. A re-render reuses images with the same key, also if their page moved. Lisp copies a page only if its serial changed.
   - Scale: the widest page fits the window width minus margins, times the zoom. A pixel budget per page caps it.
   - Pages without a reusable image render in parallel (`thread::scope`, up to one thread per core). A reflow re-renders all later pages.
+  - `render_slide`: one page, scaled to fit the slide view in both directions, centered on black, without border or shadow. Its key also has the view height (0 for preview pages), so page turns back and forth and unchanged edits reuse it.
+- `math.rs`: the equation at the cursor.
+  - `equation_at`: walk up from the leaf at the cursor to the innermost `SyntaxKind::Equation` whose delimiters enclose it.
+  - `cut_out`: in layout order, keep the frame items between the `Tag::Start` of the `EquationElem` with that node's span and the `Tag::End` with its location, in a copy of the page frame that keeps only those items and the groups (transform, clip) that hold them. Bounds: `TextItem::bbox` (Y flipped), `Shape::bbox`, image size, through the group transforms. Tags, not spans: content from a `#let` binding has spans outside the equation.
+  - `render`: a hard frame of the bounds plus 0.3 em padding, with the pruned page frame pushed at minus its origin, rendered by `typst_render::render` with the page's fill. Scale: buffer pixels per em / the largest font size in the equation, capped by the width limit and the pixel budget. Rendering again, not cropping the page image: the page image's scale follows the preview width and zoom.
+  - `Session::equation`: find the equation in the newest text. If the last good document has exactly that text, cut out and render (with the caret, if on that page), else mark the last image stale if it is of an equation at the same byte offset, else drop it. `EquationImage::dimmed` mixes the background (top left pixel) over it.
 - `offset.rs`: UTF-8 byte ↔ Emacs char offset conversion.
 - `sync.rs`: click jumps (`jump_from_click` with a `Snapshot` world whose main file is the document's `Source`), and the caret. `typst_ide::jump_from_cursor` returns only the start of the text node, without a font size, so `sync::caret` does its node lookup and frame walk, but stops at the glyph of the cursor (`Glyph::span.1` is the glyph's byte offset in its node).
   - The caret lives in `Session` (Lisp thread only), in points. `present_page` draws it with the current image's scale.
+  - Math shapes letters as styled chars ("x" as "𝑥", `pi` as "π"), whose UTF-8 can be longer than the source, so glyph ranges are clamped to the node. If no glyph contains the cursor, the caret goes after the node's last glyph that starts before it (node end, collapsed spaces, inside an identifier). Text, math text and math identifiers get a caret.
 
 Invariant: only defuns (Lisp thread) touch canvas memory, and only inside `with_canvas_data`. The
 thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, never panic.
@@ -62,6 +72,10 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
   - `window-size-change-functions` re-renders when the window body width changes.
 - Each page is one line: an image char with a `typst-canvas-page` text property (0-based index), and a newline. Page lines are added or removed at the end.
 - Canvas specs get an uninterned `:id`: Emacs finds canvases by `eq` spec, but its image cache matches specs by `equal`. Resize: `plist-put` of `:data-width`/`:data-height` on the same spec.
+- Equation at point: `typst-canvas--update-equation` runs at the end of `typst-canvas--update-caret`, so with each result and after point motion. It does nothing while a request is pending: that result calls it again. `post-command-hook` schedules the update when point moved, also with `typst-canvas-follow-cursor` off.
+- `typst-canvas-present-mode`: `special-mode` for `*typst-canvas presentation: NAME*`, with one canvas. The source buffer's requests add `[PAGE WIDTH HEIGHT]` while it is live; its notify handler copies a new slide serial. `window-size-change-functions` asks for a new slide on resize. Killing the buffer (`q`) drops the slide from requests, and deletes the frame or restores the windows.
+  - The presentation frame has black 8 px fringes on both sides: without a right fringe, Emacs keeps the last text column for the end of the line, and cuts the slide. The left one keeps the slide centered.
+  - A new fullscreen frame is 640x612 at first; the resize handler re-renders when fullscreen takes effect.
 - Flymake reports pass the whole buffer as `:region`, so each report replaces the last one. Without it, reports after the first in one Flymake check only add diagnostics, and a fixed error stays marked until the next check (after idle time).
 
 ## Demo (`typst-canvas-demo.el`)
@@ -78,14 +92,15 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
 - `cargo test`: Rust unit tests (offsets, pixel conversion, compile, diagnostics, session thread).
 - `bin/test.sh`: ERT in batch mode (`EMACS=emacs-32-gtk`).
 - `bin/latency.sh`: edit-to-screen latency under Xvfb (`bin/latency.el`), on `examples/showcase.typ`. Prints median, min and max of the total, compile, render, Lisp and redisplay times.
-- `bin/screenshot.sh`: GUI under Xvfb (`bin/screenshot.el`), saves `target/screenshot-{1..5}.png`: light theme with the caret, a compile error (stale pages), `modus-vivendi` loaded at run time, the pulse right after a click jump, zoom + hscroll.
-- `bin/screencast.sh`: records `typst-canvas-demo` under Xvfb (1600x900, `modus-vivendi`). `bin/screencast.el` starts ffmpeg (`x11grab`, lossless) when the first pages show and stops it after the demo, so the video spans the demo only. The script then encodes `target/screencast.mp4` and `target/screencast.gif` (12 fps, 1000 px wide, one palette from the changing pixels).
+- `bin/screenshot.sh`: GUI under Xvfb (`bin/screenshot.el`), saves `target/screenshot-{1..9}.png`: light theme with the caret, a compile error (stale pages), `modus-vivendi` loaded at run time, the pulse right after a click jump, zoom + hscroll, the equation at point, the same equation dimmed by an error, `examples/slides.typ` presented (slide 1), slide 4 after an edit in the source.
+- `bin/screencast.sh`: records `typst-canvas-demo` under Xvfb (1600x900, `modus-vivendi`). `bin/screencast.el` starts ffmpeg (`x11grab`, lossless) when the first pages show and stops it after the demo, so the video spans the demo only. The script then encodes `target/screencast.mp4` and `target/screencast.gif` (12 fps, 1000 px wide, one palette from the changing pixels). `bin/screencast.sh inline-math` hides the preview window (`display-buffer-no-window`) and types an equation, then moves through math and out (1280x720, `target/inline-math.{mp4,gif}`, 960 px wide).
 
 ## Phases
 
 1. Done. Core: scaffold, world, session thread, pipe notify, multi-page canvases, fit/zoom, diagnostics (header line + Flymake), tests, scripts.
 2. Done. Sync and polish: backward/forward sync, theme, page decoration, zoom hscroll, header line. (Phase 1 already reuses page images by key.)
 3. Done. Showcase: demo document, self-typing demo command, screencast (MP4 + GIF), README. Also a latency benchmark, and the optimizations it showed (`opt-level` 2, parallel page rendering).
+   - 3b. Done. Equation at point (cut out of the laid-out page), presentation mode, `examples/slides.typ`.
 4. Review: code review pass, fixes, docs.
 
 ## Typst 0.15 API notes
