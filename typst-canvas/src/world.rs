@@ -1,16 +1,17 @@
 //! The Typst world of a preview: the buffer text is the main file, everything else comes from disk.
 
 use std::{
+    collections::HashMap,
     error::Error,
-    fmt,
+    fmt, mem,
     ops::Range,
     path::{Path, PathBuf},
-    sync::{Arc, LazyLock},
+    sync::{Arc, LazyLock, Mutex},
 };
 
 use typst::{
     Library, LibraryExt, World, WorldExt,
-    diag::{FileResult, Severity, SourceDiagnostic, Warned},
+    diag::{FileError, FileResult, Severity, SourceDiagnostic, Warned},
     foundations::{Bytes, Datetime, Duration, Smart},
     layout::{Celled, PageElem, Sides},
     model::TableElem,
@@ -29,7 +30,7 @@ use typst_kit::{
 };
 use typst_layout::PagedDocument;
 
-use crate::offset;
+use crate::{lock, offset};
 
 /// User agent for package downloads from Typst Universe.
 const USER_AGENT: &str = concat!("typst-canvas/", env!("CARGO_PKG_VERSION"));
@@ -46,10 +47,12 @@ static FONTS: LazyLock<FontStore> = LazyLock::new(|| {
 pub struct PreviewWorld {
     /// The buffer text. It is edited in place, so that Typst can reparse incrementally.
     main: Source,
-    library: LazyHash<Library>,
+    library: Arc<LazyHash<Library>>,
     theme: Option<Theme>,
     /// Other project files and packages, loaded from disk on demand.
     files: FileStore<SystemFiles>,
+    /// The other files that the running compile read as sources. Its document keeps them.
+    used: Mutex<HashMap<FileId, Source>>,
     time: Time,
 }
 
@@ -68,12 +71,23 @@ pub struct Compiled {
     pub diagnostics: Vec<Diagnostic>,
 }
 
-/// A compiled document, with the main file text that it came from. Spans in the document resolve
-/// against this text, which can be older than the world's after a failed compile.
+/// A compiled document, with the sources that it came from. It is a `World` that resolves the spans
+/// of the document against those sources: the preview world can have newer text after a failed
+/// compile, and the compile thread holds it.
 #[derive(Debug)]
 pub struct Document {
     pub paged: PagedDocument,
+    /// The main file.
     pub source: Source,
+    /// The other files that the compile read as sources.
+    files: HashMap<FileId, OtherFile>,
+    library: Arc<LazyHash<Library>>,
+}
+
+#[derive(Debug)]
+struct OtherFile {
+    source: Source,
+    path: Option<PathBuf>,
 }
 
 #[derive(Debug)]
@@ -105,9 +119,10 @@ impl PreviewWorld {
         let files = SystemFiles::new(FsRoot::new(PathBuf::from(root)), packages);
         Ok(Self {
             main: Source::new(id, String::new()),
-            library: LazyHash::new(library(None)),
+            library: Arc::new(LazyHash::new(library(None))),
             theme: None,
             files: FileStore::new(files),
+            used: Mutex::default(),
             time: Time::system(),
         })
     }
@@ -120,11 +135,6 @@ impl PreviewWorld {
         self.time = Time::system();
     }
 
-    /// Return the file system path of the file ID.
-    pub fn path(&self, id: FileId) -> Option<PathBuf> {
-        self.files.loader().resolve(id).ok()
-    }
-
     /// Set the default colors. Return true if they changed, and so the document must be compiled
     /// again.
     ///
@@ -135,17 +145,20 @@ impl PreviewWorld {
             return false;
         }
         self.theme = theme;
-        self.library = LazyHash::new(library(theme));
+        self.library = Arc::new(LazyHash::new(library(theme)));
         true
     }
 
     pub fn compile(&self) -> Compiled {
+        lock(&self.used).clear();
         let Warned { output, warnings } = typst::compile::<PagedDocument>(self);
         let (document, errors) = match output {
             Ok(paged) => (
                 Some(Document {
                     paged,
                     source: self.main.clone(),
+                    files: self.used_files(),
+                    library: Arc::clone(&self.library),
                 }),
                 Default::default(),
             ),
@@ -160,6 +173,17 @@ impl PreviewWorld {
             document,
             diagnostics,
         }
+    }
+
+    /// Take the other files that the compile read as sources, and find their paths.
+    fn used_files(&self) -> HashMap<FileId, OtherFile> {
+        mem::take(&mut *lock(&self.used))
+            .into_iter()
+            .map(|(id, source)| {
+                let path = self.files.loader().resolve(id).ok();
+                (id, OtherFile { source, path })
+            })
+            .collect()
     }
 
     /// Convert DIAGNOSTIC into a char range in the main file. A diagnostic in another file goes
@@ -248,10 +272,11 @@ impl World for PreviewWorld {
 
     fn source(&self, id: FileId) -> FileResult<Source> {
         if id == self.main.id() {
-            Ok(self.main.clone())
-        } else {
-            self.files.source(id)
+            return Ok(self.main.clone());
         }
+        let source = self.files.source(id)?;
+        lock(&self.used).insert(id, source.clone());
+        Ok(source)
     }
 
     fn file(&self, id: FileId) -> FileResult<Bytes> {
@@ -272,6 +297,54 @@ impl World for PreviewWorld {
 }
 
 impl IdeWorld for PreviewWorld {
+    fn upcast(&self) -> &dyn World {
+        self
+    }
+}
+
+impl Document {
+    /// Return the file system path of the file ID, if the compile read it as a source.
+    pub fn path(&self, id: FileId) -> Option<&Path> {
+        self.files.get(&id)?.path.as_deref()
+    }
+}
+
+impl World for Document {
+    fn library(&self) -> &LazyHash<Library> {
+        &self.library
+    }
+
+    fn book(&self) -> &LazyHash<FontBook> {
+        FONTS.book()
+    }
+
+    fn main(&self) -> FileId {
+        self.source.id()
+    }
+
+    fn source(&self, id: FileId) -> FileResult<Source> {
+        if id == self.source.id() {
+            return Ok(self.source.clone());
+        }
+        let file = self.files.get(&id).ok_or(FileError::Other(None))?;
+        Ok(file.source.clone())
+    }
+
+    fn file(&self, id: FileId) -> FileResult<Bytes> {
+        self.source(id).map(Bytes::from_string)
+    }
+
+    fn font(&self, index: usize) -> Option<Font> {
+        FONTS.font(index)
+    }
+
+    /// Jumps do not evaluate code, so they need no date.
+    fn today(&self, _offset: Option<Duration>) -> Option<Datetime> {
+        None
+    }
+}
+
+impl IdeWorld for Document {
     fn upcast(&self) -> &dyn World {
         self
     }

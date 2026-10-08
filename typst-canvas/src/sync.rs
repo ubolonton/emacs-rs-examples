@@ -4,21 +4,14 @@
 use std::{num::NonZeroUsize, path::PathBuf};
 
 use typst::{
-    Library, World,
-    diag::FileResult,
-    foundations::{Bytes, Datetime, Duration},
+    World,
     introspection::PagedPosition,
     layout::{Abs, Frame, FrameItem, Point, Transform},
-    syntax::{FileId, LinkedNode, Side, Source, Span, SyntaxKind},
-    text::{Font, FontBook},
-    utils::LazyHash,
+    syntax::{LinkedNode, Side, Span, SyntaxKind},
 };
-use typst_ide::{IdeWorld, Jump};
+use typst_ide::Jump;
 
-use crate::{
-    offset,
-    world::{Document, PreviewWorld},
-};
+use crate::{offset, world::Document};
 
 /// Where a click on a page leads.
 #[derive(Debug, Clone, PartialEq)]
@@ -32,29 +25,21 @@ pub enum Target {
     Position(usize, Point),
 }
 
-/// Return where a click at POINT on page INDEX (0-based) of DOCUMENT leads.
-pub fn jump(
-    world: &PreviewWorld,
-    document: &Document,
-    index: usize,
-    point: Point,
-) -> Option<Target> {
-    let snapshot = Snapshot {
-        world,
-        main: &document.source,
-    };
+/// Return where a click at POINT on page INDEX (0-based) of DOCUMENT leads. The document has its
+/// sources, so this needs no world, and does not wait for a compile.
+pub fn jump(document: &Document, index: usize, point: Point) -> Option<Target> {
     let position = PagedPosition {
         page: NonZeroUsize::new(index + 1)?,
         point,
     };
-    match typst_ide::jump_from_click(&snapshot, &document.paged, &position)? {
+    match typst_ide::jump_from_click(document, &document.paged, &position)? {
         Jump::File(id, byte) if id == document.source.id() => Some(Target::Main(
             offset::byte_to_char(document.source.text(), byte),
         )),
         Jump::File(id, byte) => {
-            let source = world.source(id).ok()?;
+            let source = document.source(id).ok()?;
             Some(Target::File(
-                world.path(id)?,
+                document.path(id)?.to_owned(),
                 offset::byte_to_char(source.text(), byte),
             ))
         }
@@ -165,73 +150,14 @@ impl GlyphSearch {
     }
 }
 
-/// The world, but with the main file text of a document, so that the document's spans resolve.
-struct Snapshot<'a> {
-    world: &'a PreviewWorld,
-    main: &'a Source,
-}
-
-impl World for Snapshot<'_> {
-    fn library(&self) -> &LazyHash<Library> {
-        self.world.library()
-    }
-
-    fn book(&self) -> &LazyHash<FontBook> {
-        self.world.book()
-    }
-
-    fn main(&self) -> FileId {
-        self.main.id()
-    }
-
-    fn source(&self, id: FileId) -> FileResult<Source> {
-        if id == self.main.id() {
-            Ok(self.main.clone())
-        } else {
-            self.world.source(id)
-        }
-    }
-
-    fn file(&self, id: FileId) -> FileResult<Bytes> {
-        if id == self.main.id() {
-            Ok(Bytes::from_string(self.main.clone()))
-        } else {
-            self.world.file(id)
-        }
-    }
-
-    fn font(&self, index: usize) -> Option<Font> {
-        self.world.font(index)
-    }
-
-    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
-        self.world.today(offset)
-    }
-}
-
-impl IdeWorld for Snapshot<'_> {
-    fn upcast(&self) -> &dyn World {
-        self
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use typst::layout::Abs;
 
     use super::*;
-    use crate::testing::{self, TestResult};
+    use crate::testing::{self, TestResult, compile};
 
     const PAGE: &str = "#set page(width: 100pt, height: 100pt, margin: 10pt)\n";
-
-    fn compile(text: &str) -> TestResult<(PreviewWorld, Document)> {
-        let world = testing::world(text)?;
-        let compiled = world.compile();
-        let document = compiled
-            .document
-            .ok_or_else(|| format!("{:?}", compiled.diagnostics))?;
-        Ok((world, document))
-    }
 
     /// A point in the first line of text, at X points from the left page edge.
     fn first_line(x: f64) -> Point {
@@ -246,7 +172,7 @@ mod tests {
     #[test]
     fn caret_follows_cursor_within_text() -> TestResult {
         let text = format!("{PAGE}Hello world");
-        let (_, document) = compile(&text)?;
+        let document = compile(&text)?;
         let start =
             caret_at(&document, &text, "Hello", 0).ok_or("no caret at the start of the text")?;
         assert_eq!(start.page, 0);
@@ -265,7 +191,7 @@ mod tests {
     #[test]
     fn caret_moves_past_math_letters() -> TestResult {
         let text = format!("{PAGE}$x^2 + alpha$");
-        let (_, document) = compile(&text)?;
+        let document = compile(&text)?;
         let x = |needle: &str, shift: usize| {
             caret_at(&document, &text, needle, shift)
                 .map(|caret| caret.point.x.to_pt())
@@ -283,7 +209,7 @@ mod tests {
     #[test]
     fn caret_finds_page() -> TestResult {
         let text = format!("{PAGE}A\n#pagebreak()\nB");
-        let (_, document) = compile(&text)?;
+        let document = compile(&text)?;
         assert_eq!(
             caret_at(&document, &text, "B", 0).map(|caret| caret.page),
             Some(1)
@@ -294,7 +220,7 @@ mod tests {
     #[test]
     fn caret_is_hidden_outside_text() -> TestResult {
         let text = format!("{PAGE}Hello");
-        let (_, document) = compile(&text)?;
+        let document = compile(&text)?;
         assert_eq!(caret_at(&document, &text, "page", 0), None);
         Ok(())
     }
@@ -302,25 +228,29 @@ mod tests {
     #[test]
     fn click_on_text_jumps_to_char() -> TestResult {
         let text = format!("{PAGE}é Hello");
-        let (world, document) = compile(&text)?;
+        let document = compile(&text)?;
         // Right after the left margin: before "é".
-        let target = jump(&world, &document, 0, first_line(10.5));
+        let target = jump(&document, 0, first_line(10.5));
         let start = text.chars().count() - "é Hello".chars().count();
         assert_eq!(target, Some(Target::Main(start)));
-        assert_eq!(jump(&world, &document, 0, first_line(95.0)), None);
-        assert_eq!(jump(&world, &document, 1, first_line(10.5)), None);
+        assert_eq!(jump(&document, 0, first_line(95.0)), None);
+        assert_eq!(jump(&document, 1, first_line(10.5)), None);
         Ok(())
     }
 
     #[test]
     fn click_uses_text_of_document_after_failed_compile() -> TestResult {
         let text = format!("{PAGE}Hello");
-        let (mut world, document) = compile(&text)?;
+        let mut world = testing::world(&text)?;
+        let document = world
+            .compile()
+            .document
+            .ok_or("the first text does not compile")?;
         world.set_main_text(&format!("#nope\n{text}"));
         assert!(world.compile().document.is_none());
         let start = text.chars().count() - "Hello".chars().count();
         assert_eq!(
-            jump(&world, &document, 0, first_line(10.5)),
+            jump(&document, 0, first_line(10.5)),
             Some(Target::Main(start))
         );
         Ok(())
@@ -331,14 +261,14 @@ mod tests {
         let text = format!(
             "{PAGE}#link(\"https://typst.app\")[Web] #link(<there>)[Here]\n#pagebreak()\n= There <there>"
         );
-        let (world, document) = compile(&text)?;
+        let document = compile(&text)?;
         assert_eq!(
-            jump(&world, &document, 0, first_line(11.0)),
+            jump(&document, 0, first_line(11.0)),
             Some(Target::Url("https://typst.app".into()))
         );
         assert!(
             matches!(
-                jump(&world, &document, 0, first_line(35.0)),
+                jump(&document, 0, first_line(35.0)),
                 Some(Target::Position(1, _))
             ),
             "expected a position on page 2"
@@ -348,16 +278,22 @@ mod tests {
 
     #[test]
     fn click_on_included_text_jumps_to_its_file() -> TestResult {
-        let (world, document) =
-            compile(&format!("{PAGE}#include \"tests/fixtures/included.typ\""))?;
-        let target = jump(&world, &document, 0, first_line(10.5));
-        assert!(
-            matches!(
-                &target,
-                Some(Target::File(path, 0)) if path.ends_with("tests/fixtures/included.typ")
-            ),
-            "{target:?}"
-        );
+        let text = format!("{PAGE}#include \"tests/fixtures/included.typ\"");
+        let mut world = testing::world(&text)?;
+        // The second compile reuses memoized results of the first. Its document must have the
+        // included source too.
+        for round in 0..2 {
+            world.set_main_text(&text);
+            let document = world.compile().document.ok_or("no document")?;
+            let target = jump(&document, 0, first_line(10.5));
+            assert!(
+                matches!(
+                    &target,
+                    Some(Target::File(path, 0)) if path.ends_with("tests/fixtures/included.typ")
+                ),
+                "compile {round}: {target:?}"
+            );
+        }
         Ok(())
     }
 }

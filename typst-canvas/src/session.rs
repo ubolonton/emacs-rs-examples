@@ -1,8 +1,12 @@
 //! A preview session: a background thread that compiles and renders the newest request.
 //!
 //! Lisp puts requests into a one-element slot. A new request replaces an unserved one, so the
-//! thread always works on the newest text, and the Lisp thread never waits for a compile. After
-//! each request, the thread publishes an [`Output`] and writes one byte to the notify pipe.
+//! thread always works on the newest text. After each request, the thread publishes an [`Output`]
+//! and writes one byte to the notify pipe.
+//!
+//! The Lisp thread never waits for the session thread, which can be in a long compile, e.g. a
+//! package download or the first font scan. The thread owns the world. Lisp holds the other locks
+//! only for short copies, and stopping does not join the thread.
 
 use std::{
     io::{self, Write},
@@ -10,14 +14,14 @@ use std::{
     ops::Range,
     panic::{self, AssertUnwindSafe},
     sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
-    thread::{self, JoinHandle},
+    thread,
     time::Instant,
 };
 
 use typst::{comemo, diag::Severity, layout::Point, syntax::Source};
 
 use crate::{
-    STACK_SIZE,
+    STACK_SIZE, lock,
     math::{self, EquationImage, EquationView},
     offset,
     render::{self, PageImage, SlideView, View},
@@ -73,18 +77,23 @@ struct Slot {
     stop: bool,
 }
 
+/// Where the thread writes after each served request.
+type Notify = Box<dyn Write + Send>;
+
 struct Shared {
     slot: Mutex<Slot>,
     wake: Condvar,
-    /// Locked by the thread while it compiles.
-    world: Mutex<PreviewWorld>,
     output: Mutex<Output>,
+    /// `None` after the session stopped. The thread writes while it holds the lock.
+    notify: Mutex<Option<Notify>>,
+    /// Called on the thread after each compile. Tests use it to keep the thread busy.
+    #[cfg(test)]
+    after_compile: Mutex<Option<Box<dyn FnMut() + Send>>>,
 }
 
 /// Owned by Lisp as a `user-ptr`. Dropping it stops the thread.
 pub struct Session {
     shared: Arc<Shared>,
-    thread: Option<JoinHandle<()>>,
     /// The caret and its color (`0xRRGGBB`). Only the Lisp thread uses it, to draw onto canvases.
     caret: Mutex<Option<(Caret, u32)>>,
     /// The newest text sent, parsed. Only the Lisp thread uses it, to find the equation at the
@@ -113,23 +122,25 @@ pub struct CaretPlace {
 
 impl Session {
     /// Start a thread that compiles in WORLD, and writes to NOTIFY after each served request.
-    pub fn start(world: PreviewWorld, mut notify: impl Write + Send + 'static) -> io::Result<Self> {
+    pub fn start(world: PreviewWorld, notify: impl Write + Send + 'static) -> io::Result<Self> {
         let shared = Arc::new(Shared {
             slot: Mutex::default(),
             wake: Condvar::new(),
-            world: Mutex::new(world),
             output: Mutex::default(),
+            notify: Mutex::new(Some(Box::new(notify))),
+            #[cfg(test)]
+            after_compile: Mutex::default(),
         });
-        let thread = thread::Builder::new()
+        // Detached: `stop` does not wait for it.
+        thread::Builder::new()
             .name("typst-canvas".into())
             .stack_size(STACK_SIZE)
             .spawn({
                 let shared = Arc::clone(&shared);
-                move || shared.run(&mut notify)
+                move || shared.run(world)
             })?;
         Ok(Self {
             shared,
-            thread: Some(thread),
             caret: Mutex::default(),
             text: Mutex::new(Source::detached(String::new())),
             equation: Mutex::default(),
@@ -158,15 +169,13 @@ impl Session {
     }
 
     /// Return where a click at pixel X, Y of the image of page INDEX leads.
-    ///
-    /// Waits for the current compile, because it needs the world.
     pub fn jump(&self, index: usize, x: f64, y: f64) -> Option<Target> {
         let (document, image) = {
             let output = self.output();
             (output.document.clone()?, output.pages.get(index).cloned()?)
         };
         let point = image.point_at(x, y)?;
-        sync::jump(&lock(&self.shared.world), &document, index, point)
+        sync::jump(&document, index, point)
     }
 
     /// Move the caret to char offset CURSOR of the main file, or hide it if CURSOR is `None` or not
@@ -255,27 +264,35 @@ impl Session {
         Some(output.pages.get(index)?.pixel_at(point).1)
     }
 
-    /// Stop the thread. Wait for it to finish the current request.
-    pub fn stop(&mut self) {
+    /// Stop the thread, without waiting for it. It finishes its current request, if any, and
+    /// exits.
+    ///
+    /// After this returns, the thread does not write to the notify pipe anymore. Lisp deletes the
+    /// pipe process next, and in batch mode, a write to a deleted pipe kills Emacs (`SIGPIPE`).
+    pub fn stop(&self) {
         lock(&self.shared.slot).stop = true;
         self.shared.wake.notify_one();
-        if let Some(thread) = self.thread.take() {
-            // The thread catches panics from Typst, so there is nothing to report.
-            let _ = thread.join();
-        }
+        // The thread writes while it holds this lock, so no write is in progress after this. A
+        // write blocks only while the pipe is full: 64 KiB of notifications that Emacs did not
+        // read, when it sent at least as many requests.
+        lock(&self.shared.notify).take();
     }
 }
 
 impl Drop for Session {
+    /// Emacs drops the session in a GC finalizer, so this must not wait for the thread either.
     fn drop(&mut self) {
         self.stop();
     }
 }
 
 impl Shared {
-    fn run(&self, notify: &mut impl Write) {
+    fn run(&self, mut world: PreviewWorld) {
         while let Some((id, request)) = self.take_request() {
-            if panic::catch_unwind(AssertUnwindSafe(|| self.serve(id, request))).is_err() {
+            let served = panic::catch_unwind(AssertUnwindSafe(|| {
+                self.serve(&mut world, id, request);
+            }));
+            if served.is_err() {
                 let mut output = lock(&self.output);
                 output.served = id;
                 output.diagnostics = vec![Diagnostic {
@@ -286,7 +303,9 @@ impl Shared {
             }
             // Emacs can delete the pipe process before the session stops. Nobody is listening
             // then.
-            let _ = notify.write_all(b"\n");
+            if let Some(notify) = lock(&self.notify).as_mut() {
+                let _ = notify.write_all(b"\n");
+            }
         }
     }
 
@@ -304,16 +323,17 @@ impl Shared {
         }
     }
 
-    fn serve(&self, id: u64, request: Request) {
+    fn serve(&self, world: &mut PreviewWorld, id: u64, request: Request) {
         let start = Instant::now();
-        let compiled = {
-            let mut world = lock(&self.world);
-            let theme_changed = world.set_theme(request.theme);
-            if let Some(text) = &request.text {
-                world.set_main_text(text);
-            }
-            (theme_changed || request.text.is_some()).then(|| world.compile())
-        };
+        let theme_changed = world.set_theme(request.theme);
+        if let Some(text) = &request.text {
+            world.set_main_text(text);
+        }
+        let compiled = (theme_changed || request.text.is_some()).then(|| world.compile());
+        #[cfg(test)]
+        if let Some(after_compile) = lock(&self.after_compile).as_mut() {
+            after_compile();
+        }
         let compiled = compiled.map(
             |Compiled {
                  document,
@@ -364,12 +384,6 @@ impl Shared {
     }
 }
 
-/// Lock MUTEX. A panic while it was locked does not leave its data in a state that we cannot
-/// use, because all updates are single assignments.
-fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
-    mutex.lock().unwrap_or_else(PoisonError::into_inner)
-}
-
 fn elapsed_ms(start: Instant) -> f64 {
     start.elapsed().as_secs_f64() * 1000.0
 }
@@ -381,6 +395,8 @@ mod tests {
         sync::mpsc::{self, Receiver, Sender},
         time::Duration,
     };
+
+    use typst::layout::Abs;
 
     use super::*;
     use crate::testing::{TestResult, find};
@@ -636,23 +652,69 @@ mod tests {
         Ok(())
     }
 
+    /// Keep the session thread busy after its next compile, until the returned sender is dropped.
+    /// The receiver gets a message when the thread is busy.
+    fn block_after_compile(session: &Session) -> (Sender<()>, Receiver<()>) {
+        let (release, released) = mpsc::channel::<()>();
+        let (busy, busy_receiver) = mpsc::channel();
+        *lock(&session.shared.after_compile) = Some(Box::new(move || {
+            let _ = busy.send(());
+            let _ = released.recv();
+        }));
+        (release, busy_receiver)
+    }
+
     #[test]
-    fn stop_joins_thread() -> TestResult {
-        let (mut session, notifications) = start()?;
-        session.request(Request {
-            text: Some("A".into()),
+    fn busy_thread_blocks_neither_jump_nor_stop() -> TestResult {
+        let (session, notifications) = start()?;
+        let text = "#set page(width: 100pt, height: 100pt, margin: 10pt)\nHello";
+        let id = session.request(Request {
+            text: Some(text.into()),
             theme: None,
             view: view(200),
             slide: None,
         });
-        session.stop();
-        assert!(session.thread.is_none());
-        // The thread dropped the writer.
-        while notifications.recv_timeout(TIMEOUT).is_ok() {}
-        assert!(matches!(
+        wait_for(&session, &notifications, id);
+        let (release, busy) = block_after_compile(&session);
+        session.request(Request {
+            text: Some(format!("{text} world")),
+            theme: None,
+            view: view(200),
+            slide: None,
+        });
+        busy.recv_timeout(TIMEOUT)?;
+
+        let image = session.output().pages[0].clone();
+        let (x, y) = image.pixel_at(Point::new(Abs::pt(10.5), Abs::pt(15.0)));
+        assert_eq!(
+            session.jump(0, x, y),
+            Some(Target::Main(find(text, "Hello")?))
+        );
+
+        // Drop the session on another thread, so that a wait fails the test instead of hanging it.
+        let shared = Arc::downgrade(&session.shared);
+        let (dropped, dropped_receiver) = mpsc::channel();
+        thread::spawn(move || {
+            drop(session);
+            let _ = dropped.send(());
+        });
+        dropped_receiver
+            .recv_timeout(TIMEOUT)
+            .map_err(|_| "dropping the session waits for the thread")?;
+        // The writer is gone, but the thread still runs.
+        while notifications.try_recv().is_ok() {}
+        assert_eq!(
             notifications.try_recv(),
             Err(mpsc::TryRecvError::Disconnected)
-        ));
+        );
+        assert!(shared.upgrade().is_some());
+        // Released, it exits.
+        drop(release);
+        let deadline = Instant::now() + TIMEOUT;
+        while shared.upgrade().is_some() {
+            assert!(Instant::now() < deadline, "the thread does not exit");
+            thread::sleep(Duration::from_millis(10));
+        }
         Ok(())
     }
 }

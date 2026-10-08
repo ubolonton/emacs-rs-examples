@@ -13,7 +13,10 @@ mod sync;
 mod testing;
 mod world;
 
-use std::path::Path;
+use std::{
+    path::Path,
+    sync::{Mutex, MutexGuard, PoisonError},
+};
 
 use emacs::{Env, Result, Value, Vector, defun};
 use typst::diag::Severity;
@@ -32,6 +35,12 @@ emacs::plugin_is_GPL_compatible!();
 /// nested content without a depth limit, and a stack overflow aborts Emacs. So give each thread as
 /// much stack as a main thread, not the default 2 MiB.
 const STACK_SIZE: usize = 8 * 1024 * 1024;
+
+/// Lock MUTEX. A panic while it was locked does not leave its data in a state that we cannot use,
+/// because all updates are single assignments or insertions.
+fn lock<T>(mutex: &Mutex<T>) -> MutexGuard<'_, T> {
+    mutex.lock().unwrap_or_else(PoisonError::into_inner)
+}
 
 #[emacs::module(
     name = "typst-canvas-dyn",
@@ -90,9 +99,10 @@ fn session_request(
     }))
 }
 
-/// Stop the thread of SESSION. Wait for it to finish the current request.
+/// Stop the thread of SESSION, without waiting for it. After this, it does not write to its
+/// pipe process anymore.
 #[defun]
-fn session_stop(session: &mut Session) -> Result<()> {
+fn session_stop(session: &Session) -> Result<()> {
     session.stop();
     Ok(())
 }
