@@ -23,7 +23,7 @@
 (defconst typst-canvas-latency--timeout 60
   "Seconds after which the run fails.")
 
-(defconst typst-canvas-latency--anchor "Click\nany word"
+(defconst typst-canvas-latency--anchor "Click any word"
   "Text on page 1 where edits go, right before it.")
 
 (defconst typst-canvas-latency--paragraph "#lorem(90) "

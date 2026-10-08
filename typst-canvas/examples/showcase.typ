@@ -1,5 +1,7 @@
-// A showcase for typst-canvas. It uses no packages, so it works offline. Colors that must follow
-// the Emacs theme come from `text.fill`; fixed colors are bright, or transparent tints.
+// A showcase for typst-canvas. It uses no packages, so it works
+// offline. Colors that must follow the Emacs theme come from
+// `text.fill`; fixed colors are bright, or transparent tints. Lines fit
+// in 72 columns, the width of a source window next to the preview.
 
 #let violet = rgb("#7048e8")
 #let blue = rgb("#1c7ed6")
@@ -30,8 +32,12 @@
   }
   it.body
 })
-#show link: it => if type(it.dest) == str { underline(text(fill: blue, it)) } else { it }
-#show raw.where(block: true): block.with(fill: tint(blue), inset: 8pt, radius: 4pt, width: 100%)
+#show link: it => if type(it.dest) == str {
+  underline(text(fill: blue, it))
+} else { it }
+#show raw.where(block: true): block.with(
+  fill: tint(blue), inset: 8pt, radius: 4pt, width: 100%,
+)
 #show figure.caption: set text(size: 8.5pt)
 
 #block(
@@ -43,25 +49,29 @@
   #set text(fill: white)
   #text(size: 21pt, weight: "bold")[Typst, live in Emacs]
   #v(-6pt)
-  #text(size: 10.5pt)[Compiled on a background thread, painted into canvas images]
+  #text(size: 10.5pt)[Compiled on a background thread, painted into
+    canvas images]
 ]
 
 #outline(indent: auto)
 
 = Introduction
 
-This page comes from a Typst file that Emacs compiles while you type. A Rust module runs the
-compiler on a background thread, rasterizes the pages, and copies the pixels into canvas
-images#footnote[Canvas images are new in Emacs 32. Rust writes their pixels directly.]. Click
-any word to jump to its source, and watch the caret follow the cursor. Learn more about the
-language at #link("https://typst.app/docs")[typst.app/docs].
+This page comes from a Typst file that Emacs compiles while you type.
+A Rust module runs the compiler on a background thread, rasterizes the
+pages, and copies the pixels into canvas images#footnote[Canvas images
+are new in Emacs 32. Rust writes their pixels directly.].
+Click any word to jump to its source, and watch the caret follow the
+cursor. Learn more about the language at
+#link("https://typst.app/docs")[typst.app/docs].
 
 = Equations
 
 Maxwell's equations, in differential form:
 $ nabla dot bold(E) = rho / epsilon_0, quad nabla dot bold(B) = 0 $
 $ nabla times bold(E) = - (partial bold(B)) / (partial t), quad
-  nabla times bold(B) = mu_0 bold(J) + mu_0 epsilon_0 (partial bold(E)) / (partial t) $
+  nabla times bold(B) = mu_0 bold(J)
+    + mu_0 epsilon_0 (partial bold(E)) / (partial t) $
 
 The Fourier transform of a function $f$:
 $ hat(f)(xi) = integral_(-oo)^(oo) f(x) e^(-2 pi i x xi) dif x $
@@ -74,7 +84,10 @@ $ hat(f)(xi) = integral_(-oo)^(oo) f(x) e^(-2 pi i x xi) dif x $
 
 = Figures
 
-#let data = (("Mon", 12), ("Tue", 19), ("Wed", 15), ("Thu", 24), ("Fri", 21), ("Sat", 9), ("Sun", 6))
+#let data = (
+  ("Mon", 12), ("Tue", 19), ("Wed", 15), ("Thu", 24),
+  ("Fri", 21), ("Sat", 9), ("Sun", 6),
+)
 #let peak = calc.max(..data.map(((_, value)) => value))
 
 #figure(
@@ -88,7 +101,7 @@ $ hat(f)(xi) = integral_(-oo)^(oo) f(x) e^(-2 pi i x xi) dif x $
       v(-2pt)
       rect(
         width: 18pt,
-        height: value / peak * 2.6cm,
+        height: value / peak * 2.2cm,
         radius: (top: 3pt),
         fill: gradient.linear(teal, blue, angle: 90deg),
       )
@@ -98,16 +111,25 @@ $ hat(f)(xi) = integral_(-oo)^(oo) f(x) e^(-2 pi i x xi) dif x $
   caption: [Edits per day, drawn from a data array with a loop.],
 )
 
-#let plot(functions, width: 100%, height: 3cm, domain: (0, 4 * calc.pi), samples: 120) = layout(size => {
-  let width = if type(width) == ratio { size.width * width } else { width }
+#let plot(
+  functions,
+  width: 100%,
+  height: 2.5cm,
+  domain: (0, 4 * calc.pi),
+  samples: 120,
+) = layout(size => {
+  let width = if type(width) == ratio {
+    size.width * width
+  } else { width }
   let (start, end) = domain
   let x-of(x) = (x - start) / (end - start) * width
   let y-of(y) = height / 2 - y * height / 2.3
   context {
     let ink = text.fill
     box(width: width, height: height, {
-      place(line(start: (0pt, height / 2), end: (width, height / 2), stroke: 0.6pt + ink))
-      place(line(start: (0pt, 0pt), end: (0pt, height), stroke: 0.6pt + ink))
+      let axis = 0.6pt + ink
+      place(line(start: (0pt, height / 2), length: width, stroke: axis))
+      place(line(end: (0pt, height), stroke: axis))
       for (f, color) in functions {
         let points = range(samples + 1).map(i => {
           let x = start + (end - start) * i / samples
@@ -124,8 +146,12 @@ $ hat(f)(xi) = integral_(-oo)^(oo) f(x) e^(-2 pi i x xi) dif x $
 })
 
 #figure(
-  plot(((x => calc.sin(x), blue), (x => calc.exp(-x / 5) * calc.cos(2 * x), orange))),
-  caption: [$sin x$ and a damped $e^(-x\/5) cos 2x$, plotted with `curve`.],
+  plot((
+    (x => calc.sin(x), blue),
+    (x => calc.exp(-x / 5) * calc.cos(2 * x), orange),
+  )),
+  caption: [$sin x$ and a damped $e^(-x\/5) cos 2x$, plotted with
+    `curve`.],
 )
 
 = Data
@@ -135,8 +161,12 @@ $ hat(f)(xi) = integral_(-oo)^(oo) f(x) e^(-2 pi i x xi) dif x $
   stroke: none,
   inset: (x: 6pt, y: 5pt),
   align: (left, left, right),
-  fill: (_, y) => if y == 0 { blue } else if calc.even(y) { tint(blue) },
-  table.header(..([*Stage*], [*Where*], [*Time*]).map(cell => text(fill: white, cell))),
+  fill: (_, y) => {
+    if y == 0 { blue } else if calc.even(y) { tint(blue) }
+  },
+  table.header(..([*Stage*], [*Where*], [*Time*]).map(
+    cell => text(fill: white, cell),
+  )),
   [Edit], [Emacs sends the buffer text], [0.1 ms],
   [Compile], [Typst, incremental], [1 ms],
   [Render], [`typst-render`, pages in parallel], [8 ms],
@@ -170,26 +200,28 @@ fn present_page(
 = Two columns
 
 #columns(2, gutter: 14pt)[
-  The compile thread only ever sees the newest text. If you type faster than it compiles, it
-  skips the stale versions#footnote[A one-element slot with a condition variable.], so the
-  preview never lags behind by more than one compile.
+  The compile thread only ever sees the newest text. If you type
+  faster than it compiles, it skips the stale versions#footnote[A
+  one-element slot with a condition variable.], so the preview never
+  lags behind by more than one compile.
 
-  Pages whose frames did not change keep their images. A typical edit re-renders one page,
-  unless it reflows the pages after it.
+  Pages whose frames did not change keep their images. A typical edit
+  re-renders one page, unless it reflows the pages after it.
 
   #colbreak()
 
-  Theme matching sets the page and text colors as standard library styles, not as `#set`
-  rules in your source. Source positions stay valid, so click-to-jump keeps
-  working#footnote[Even while an error keeps the last good render.].
+  Theme matching sets the page and text colors as standard library
+  styles, not as `#set` rules in your source. Source positions stay
+  valid, so click-to-jump keeps working#footnote[Even while an error
+  keeps the last good render.].
 
-  Each page is one image on its own line, so Emacs scrolls through them like through lines
-  of text.
+  Each page is one image on its own line, so Emacs scrolls through
+  them like through lines of text.
 ]
 
 = Conclusion
 
-Everything above is plain Typst: no packages, no external tools. Edit any of it, and the
-preview follows a few milliseconds later.
+Everything above is plain Typst: no packages, no external tools. Edit
+any of it, and the preview follows a few milliseconds later.
 
 #lorem(70)
