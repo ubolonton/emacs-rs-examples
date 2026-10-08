@@ -83,9 +83,9 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
 
 ## Phases
 
-1. Core: scaffold, world, session thread, pipe notify, multi-page canvases, fit/zoom, diagnostics (header line + Flymake), tests, scripts.
-2. Sync and polish: backward/forward sync, theme, page decoration, zoom hscroll, header line. (Phase 1 already reuses page images by key.)
-3. Showcase: demo document, self-typing demo command, screencast (GIF), README.
+1. Done. Core: scaffold, world, session thread, pipe notify, multi-page canvases, fit/zoom, diagnostics (header line + Flymake), tests, scripts.
+2. Done. Sync and polish: backward/forward sync, theme, page decoration, zoom hscroll, header line. (Phase 1 already reuses page images by key.)
+3. Done. Showcase: demo document, self-typing demo command, screencast (MP4 + GIF), README. Also a latency benchmark, and the optimizations it showed (`opt-level` 2, parallel page rendering).
 4. Review: code review pass, fixes, docs.
 
 ## Typst 0.15 API notes
