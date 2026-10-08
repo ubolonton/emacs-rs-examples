@@ -227,7 +227,7 @@ impl Session {
             Some(document) => {
                 let image = math::equation_at(&document.source, byte)
                     .and_then(|node| math::cut_out(&document.paged, node.span()))
-                    .map(|cutout| {
+                    .and_then(|cutout| {
                         let page = &document.paged.pages()[cutout.page];
                         math::render(page, &cutout, view, start, self.caret_on(cutout.page))
                     });
@@ -570,6 +570,33 @@ mod tests {
         });
         wait_for(&session, &notifications, id);
         assert!(session.output().slide.is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn renders_pages_without_area() -> TestResult {
+        let (session, notifications) = start()?;
+        for text in [
+            "#set page(width: 0pt)\nA",
+            "#set page(height: 0pt)\nA",
+            "#set page(width: 0pt, height: 0pt)",
+        ] {
+            let id = session.request(Request {
+                text: Some(text.into()),
+                theme: None,
+                view: view(200),
+                slide: Some(SlideView {
+                    page: 0,
+                    width: 400,
+                    height: 300,
+                }),
+            });
+            wait_for(&session, &notifications, id);
+            let output = session.output();
+            assert_eq!(output.diagnostics, [], "{text}");
+            assert_eq!(output.pages.len(), 1, "{text}");
+            assert!(output.slide.is_some(), "{text}");
+        }
         Ok(())
     }
 

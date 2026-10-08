@@ -215,14 +215,15 @@ pub struct EquationView {
 }
 
 /// Render CUTOUT of PAGE for VIEW, with CARET (and its color, `0xRRGGBB`) if it is in the
-/// equation. START is the byte offset of the equation in the source.
+/// equation. START is the byte offset of the equation in the source. Return `None` if the image
+/// would exceed the pixel budget at any scale.
 pub fn render(
     page: &Page,
     cutout: &Cutout,
     view: EquationView,
     start: usize,
     caret: Option<(Caret, u32)>,
-) -> EquationImage {
+) -> Option<EquationImage> {
     let em = if cutout.size > Abs::zero() {
         cutout.size
     } else {
@@ -231,8 +232,16 @@ pub fn render(
     let padding = Point::splat(em * PADDING);
     let origin = cutout.bounds.min - padding;
     let size = (cutout.bounds.max + padding - origin).to_size();
-    let fit = (view.px_per_em / em.to_pt()).min(view.max_width.max(1) as f64 / size.x.to_pt());
-    let pixel_per_pt = render::clamp_scale(fit, size.x.to_pt() * size.y.to_pt());
+    let max_width = view.max_width.clamp(1, render::MAX_VIEW_SIZE as usize) as f64;
+    let fit = (view.px_per_em / em.to_pt()).min(max_width / size.x.to_pt());
+    let budget = render::budget_scale(
+        size.x.to_pt(),
+        size.y.to_pt(),
+        render::ROUNDING_PIXELS,
+        0.0,
+        render::MAX_IMAGE_PIXELS,
+    );
+    let pixel_per_pt = render::bounded_scale(fit, budget);
 
     let mut frame = Frame::hard(size);
     frame.push(
@@ -245,7 +254,8 @@ pub fn render(
             ..page.clone()
         },
         pixel_per_pt,
-    );
+        render::MAX_IMAGE_PIXELS,
+    )?;
     let (width, height) = (pixmap.width() as usize, pixmap.height() as usize);
     let mut pixels = render::opaque_pixels(&pixmap);
     if let Some((caret, color)) = caret.filter(|(caret, _)| caret.page == cutout.page) {
@@ -266,13 +276,13 @@ pub fn render(
             );
         }
     }
-    EquationImage {
+    Some(EquationImage {
         serial: render::next_serial(),
         width,
         height,
         pixels,
         start,
-    }
+    })
 }
 
 #[cfg(test)]
@@ -356,11 +366,11 @@ mod tests {
             px_per_em,
             max_width,
         };
-        let small = render(page, &cutout, view(11.0, 1000), 0, None);
-        let large = render(page, &cutout, view(22.0, 1000), 0, None);
+        let small = render(page, &cutout, view(11.0, 1000), 0, None).ok_or("no image")?;
+        let large = render(page, &cutout, view(22.0, 1000), 0, None).ok_or("no image")?;
         assert_eq!(small.pixels.len(), small.width * small.height);
         assert!(large.width >= 2 * small.width - 1 && large.width <= 2 * small.width + 1);
-        let limited = render(page, &cutout, view(22.0, small.width), 0, None);
+        let limited = render(page, &cutout, view(22.0, small.width), 0, None).ok_or("no image")?;
         assert!(limited.width <= small.width);
         // The default page fill is white, and the text is black.
         let darkest = |pixels: &[u32]| pixels.iter().map(|&pixel| pixel & 0xFF).min();
