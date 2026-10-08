@@ -79,6 +79,7 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
 - `bin/test.sh`: ERT in batch mode (`EMACS=emacs-32-gtk`).
 - `bin/latency.sh`: edit-to-screen latency under Xvfb (`bin/latency.el`), on `examples/showcase.typ`. Prints median, min and max of the total, compile, render, Lisp and redisplay times.
 - `bin/screenshot.sh`: GUI under Xvfb (`bin/screenshot.el`), saves `target/screenshot-{1..5}.png`: light theme with the caret, a compile error (stale pages), `modus-vivendi` loaded at run time, the pulse right after a click jump, zoom + hscroll.
+- `bin/screencast.sh`: records `typst-canvas-demo` under Xvfb (1600x900, `modus-vivendi`). `bin/screencast.el` starts ffmpeg (`x11grab`, lossless) when the first pages show and stops it after the demo, so the video spans the demo only. The script then encodes `target/screencast.mp4` and `target/screencast.gif` (12 fps, 1000 px wide, one palette from the changing pixels).
 
 ## Phases
 
