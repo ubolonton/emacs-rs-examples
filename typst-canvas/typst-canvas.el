@@ -630,11 +630,13 @@ equation at point, which shows the caret too."
       (when (buffer-live-p typst-canvas--preview)
         (with-current-buffer typst-canvas--preview
           (setq typst-canvas--caret-page new)
-          ;; Only the pages of the old and the new caret change.
+          ;; Only the pages of the old and the new caret change.  The session answers from the
+          ;; output of the last status, which has as many pages as there are canvases, but check
+          ;; anyway: a page index past the canvases must not signal.
           (dolist (page (delete-dups (delq nil (list old new))))
             (when (< page (length typst-canvas--canvases))
               (typst-canvas--present session page)))
-          (when new
+          (when (and new (< new (length typst-canvas--canvases)))
             (typst-canvas--scroll-to-caret new top bottom)))))
     (typst-canvas--update-equation)))
 

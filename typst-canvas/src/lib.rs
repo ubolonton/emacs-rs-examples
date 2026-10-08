@@ -107,12 +107,15 @@ fn session_stop(session: &Session) -> Result<()> {
     Ok(())
 }
 
-/// Return the newest output of SESSION, as a list
+/// Make the newest output of SESSION the shown one, and return its status, as a list
 /// (SERVED PAGES ERRORS WARNINGS COMPILE-MS RENDER-MS).
 /// SERVED is the ID of the newest served request, or 0.
+///
+/// The other defuns use the shown output, until the next call. So they agree with each other in
+/// one notification handler, also if the thread publishes a newer output meanwhile.
 #[defun]
 fn session_status<'e>(env: &'e Env, session: &Session) -> Result<Value<'e>> {
-    let output = session.output();
+    let output = session.take_output();
     env.list((
         output.served,
         output.pages.len(),
@@ -123,12 +126,12 @@ fn session_status<'e>(env: &'e Env, session: &Session) -> Result<Value<'e>> {
     ))
 }
 
-/// Return the diagnostics of the newest compile of SESSION, as a list of
+/// Return the diagnostics of the shown output of SESSION, as a list of
 /// (BEG END SEVERITY MESSAGE). BEG and END are buffer positions in the text of that compile.
 /// SEVERITY is `:error' or `:warning'.
 #[defun]
 fn session_diagnostics<'e>(env: &'e Env, session: &Session) -> Result<Value<'e>> {
-    let output = session.output();
+    let output = session.shown();
     let error = env.intern(":error")?;
     let warning = env.intern(":warning")?;
     let diagnostics = output
@@ -193,7 +196,7 @@ fn session_jump<'e>(
 /// position of the page in the image. SCALE is in pixels per typographic point.
 #[defun]
 fn page_info<'e>(env: &'e Env, session: &Session, index: usize) -> Result<Option<Value<'e>>> {
-    let output = session.output();
+    let output = session.shown();
     output
         .pages
         .get(index)
@@ -240,8 +243,7 @@ fn session_set_caret<'e>(
 /// Then refresh CANVAS. Return non-nil if CANVAS had the size of the image.
 #[defun]
 fn present_page(env: &Env, session: &Session, index: usize, canvas: Value<'_>) -> Result<bool> {
-    // Release the lock before the copy, so that the thread can publish meanwhile.
-    let image = session.output().pages.get(index).cloned();
+    let image = session.shown().pages.get(index).cloned();
     let Some(image) = image else {
         return Ok(false);
     };
@@ -269,7 +271,7 @@ fn present_page(env: &Env, session: &Session, index: usize, canvas: Value<'_>) -
 /// for one. SERIAL changes when the image changes.
 #[defun]
 fn slide_info<'e>(env: &'e Env, session: &Session) -> Result<Option<Value<'e>>> {
-    let slide = session.output().slide.clone();
+    let slide = session.shown().slide.clone();
     slide
         .map(|image| env.list((image.serial, image.width, image.height)))
         .transpose()
@@ -279,7 +281,7 @@ fn slide_info<'e>(env: &'e Env, session: &Session) -> Result<Option<Value<'e>>> 
 /// size of the slide.
 #[defun]
 fn present_slide(env: &Env, session: &Session, canvas: Value<'_>) -> Result<bool> {
-    let slide = session.output().slide.clone();
+    let slide = session.shown().slide.clone();
     let Some(image) = slide else {
         return Ok(false);
     };

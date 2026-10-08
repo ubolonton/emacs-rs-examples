@@ -245,6 +245,44 @@ Return the status."
         (should-not typst-canvas-mode)
         (should-not typst-canvas--session)))))
 
+(ert-deftest typst-canvas::defuns-use-output-until-status ()
+  (typst-canvas-test--call-with-session
+   (lambda (session notifications)
+     (typst-canvas-test--serve session (concat typst-canvas-test--page "A"))
+     (let ((text (concat typst-canvas-test--page "A\n#pagebreak()\nB")))
+       (typst-canvas--session-request session text 300 1.0 typst-canvas-test--desk nil nil nil)
+       ;; One notification per served request.
+       (typst-canvas-test--wait (lambda () (>= (funcall notifications) 2)))
+       ;; The newest output has 2 pages.  Until the next status, the defuns agree with the shown
+       ;; output, which has 1, as the canvases of a notification handler do.
+       (should-not (typst-canvas--page-info session 1))
+       (should-not (eql (nth 1 (typst-canvas--session-set-caret
+                                session (string-search "B" text) 0))
+                        1))
+       (should (= (nth 1 (typst-canvas--session-status session)) 2))
+       (should (typst-canvas--page-info session 1))
+       (should (eql (nth 1 (typst-canvas--session-set-caret session (string-search "B" text) 0))
+                    1))))))
+
+(ert-deftest typst-canvas::defuns-allow-reentry-from-gc ()
+  ;; A GC while a defun builds Lisp values runs `post-gc-hook', which can call the session again.
+  (typst-canvas-test--call-with-session
+   (lambda (session _)
+     (let ((count 1000))
+       (typst-canvas-test--serve session (mapconcat #'identity (make-list count "#}") "\n"))
+       (let* ((calls 0)
+              (hook (lambda ()
+                      (cl-incf calls)
+                      (typst-canvas--session-status session)))
+              ;; GC after each 80 kB, the smallest threshold.
+              (gc-cons-threshold 0)
+              (gc-cons-percentage 0.0))
+         (add-hook 'post-gc-hook hook)
+         (unwind-protect
+             (should (= (length (typst-canvas--session-diagnostics session)) count))
+           (remove-hook 'post-gc-hook hook))
+         (should (> calls 0)))))))
+
 ;;;; Backward sync
 
 (defconst typst-canvas-test--jump-page

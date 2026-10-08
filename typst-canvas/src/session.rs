@@ -13,7 +13,7 @@ use std::{
     mem,
     ops::Range,
     panic::{self, AssertUnwindSafe},
-    sync::{Arc, Condvar, Mutex, MutexGuard, PoisonError},
+    sync::{Arc, Condvar, Mutex, PoisonError},
     thread,
     time::Instant,
 };
@@ -43,8 +43,9 @@ pub struct Request {
     pub slide: Option<SlideView>,
 }
 
-/// The newest result of the thread. Lisp reads it after a notification.
-#[derive(Debug, Default)]
+/// A result of the thread. The thread publishes a new one after each request. Lisp takes the newest
+/// after a notification.
+#[derive(Debug, Default, Clone)]
 pub struct Output {
     /// ID of the newest request that this output reflects. 0 before the first one.
     pub served: u64,
@@ -55,7 +56,7 @@ pub struct Output {
     /// The slide of the newest request that asked for one.
     pub slide: Option<Arc<PageImage>>,
     /// Diagnostics of the newest compile, also if it failed.
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Arc<Vec<Diagnostic>>,
     pub compile_ms: f64,
     pub render_ms: f64,
 }
@@ -83,7 +84,8 @@ type Notify = Box<dyn Write + Send>;
 struct Shared {
     slot: Mutex<Slot>,
     wake: Condvar,
-    output: Mutex<Output>,
+    /// The newest output.
+    output: Mutex<Arc<Output>>,
     /// `None` after the session stopped. The thread writes while it holds the lock.
     notify: Mutex<Option<Notify>>,
     /// Called on the thread after each compile. Tests use it to keep the thread busy.
@@ -94,6 +96,10 @@ struct Shared {
 /// Owned by Lisp as a `user-ptr`. Dropping it stops the thread.
 pub struct Session {
     shared: Arc<Shared>,
+    /// The output that Lisp shows: the newest one at the last `take_output`. Lisp thread only.
+    /// Defuns read this, not the newest output, so that the page count, page images, caret and
+    /// slide that one notification handler sees agree, also if the thread publishes meanwhile.
+    shown: Mutex<Arc<Output>>,
     /// The caret and its color (`0xRRGGBB`). Only the Lisp thread uses it, to draw onto canvases.
     caret: Mutex<Option<(Caret, u32)>>,
     /// The newest text sent, parsed. Only the Lisp thread uses it, to find the equation at the
@@ -141,6 +147,7 @@ impl Session {
             })?;
         Ok(Self {
             shared,
+            shown: Mutex::default(),
             caret: Mutex::default(),
             text: Mutex::new(Source::detached(String::new())),
             equation: Mutex::default(),
@@ -164,18 +171,27 @@ impl Session {
         id
     }
 
-    pub fn output(&self) -> MutexGuard<'_, Output> {
-        lock(&self.shared.output)
+    /// Make the newest output the shown one, and return it. Lisp calls this once per notification.
+    ///
+    /// Callers get an `Arc`, not a lock guard: they build Lisp values from it, and a Lisp call can
+    /// run a GC hook or the debugger, which can call a defun of this session again.
+    pub fn take_output(&self) -> Arc<Output> {
+        let newest = Arc::clone(&lock(&self.shared.output));
+        *lock(&self.shown) = Arc::clone(&newest);
+        newest
+    }
+
+    /// Return the shown output. See `take_output`.
+    pub fn shown(&self) -> Arc<Output> {
+        Arc::clone(&lock(&self.shown))
     }
 
     /// Return where a click at pixel X, Y of the image of page INDEX leads.
     pub fn jump(&self, index: usize, x: f64, y: f64) -> Option<Target> {
-        let (document, image) = {
-            let output = self.output();
-            (output.document.clone()?, output.pages.get(index).cloned()?)
-        };
+        let output = self.shown();
+        let (document, image) = (output.document.as_ref()?, output.pages.get(index)?);
         let point = image.point_at(x, y)?;
-        sync::jump(&document, index, point)
+        sync::jump(document, index, point)
     }
 
     /// Move the caret to char offset CURSOR of the main file, or hide it if CURSOR is `None` or not
@@ -188,7 +204,7 @@ impl Session {
         cursor: Option<usize>,
         color: u32,
     ) -> (Option<usize>, Option<CaretPlace>) {
-        let output = self.output();
+        let output = self.shown();
         let caret = cursor
             .zip(output.document.as_ref())
             .and_then(|(cursor, document)| {
@@ -226,7 +242,7 @@ impl Session {
             return None;
         };
         let end = offset::byte_to_char(text.text(), end);
-        let document = self.output().document.clone();
+        let document = self.shown().document.clone();
         let fresh = document.filter(|document| document.source.text() == text.text());
         drop(text);
 
@@ -260,8 +276,7 @@ impl Session {
 
     /// Return the pixel row of the page point POINT in the image of page INDEX.
     pub fn pixel_y(&self, index: usize, point: Point) -> Option<f64> {
-        let output = self.output();
-        Some(output.pages.get(index)?.pixel_at(point).1)
+        Some(self.shown().pages.get(index)?.pixel_at(point).1)
     }
 
     /// Stop the thread, without waiting for it. It finishes its current request, if any, and
@@ -294,12 +309,15 @@ impl Shared {
             }));
             if served.is_err() {
                 let mut output = lock(&self.output);
-                output.served = id;
-                output.diagnostics = vec![Diagnostic {
-                    chars: 0..0,
-                    severity: Severity::Error,
-                    message: "typst-canvas: The compiler panicked".into(),
-                }];
+                *output = Arc::new(Output {
+                    served: id,
+                    diagnostics: Arc::new(vec![Diagnostic {
+                        chars: 0..0,
+                        severity: Severity::Error,
+                        message: "typst-canvas: The compiler panicked".into(),
+                    }]),
+                    ..Output::clone(&output)
+                });
             }
             // Emacs can delete the pipe process before the session stops. Nobody is listening
             // then.
@@ -343,44 +361,37 @@ impl Shared {
                 (document.map(Arc::new), diagnostics, elapsed_ms(start))
             },
         );
-        let new_document = compiled
+        // Only this thread publishes outputs.
+        let previous = Arc::clone(&lock(&self.output));
+        let document = compiled
             .as_ref()
-            .and_then(|(document, ..)| document.clone());
-
-        // Only this thread writes the output, so it does not change while we render without the
-        // lock.
-        let (document, previous, previous_slide) = {
-            let output = lock(&self.output);
-            (
-                new_document.or_else(|| output.document.clone()),
-                output.pages.clone(),
-                output.slide.clone(),
-            )
-        };
+            .and_then(|(document, ..)| document.clone())
+            .or_else(|| previous.document.clone());
         let start = Instant::now();
-        let pages = document
-            .as_ref()
-            .map(|document| render::render_pages(&document.paged, request.view, &previous));
+        let pages = document.as_ref().map_or_else(
+            || previous.pages.clone(),
+            |document| render::render_pages(&document.paged, request.view, &previous.pages),
+        );
         let slide = document
             .as_ref()
             .zip(request.slide)
             .and_then(|(document, view)| {
-                render::render_slide(&document.paged, view, previous_slide.as_ref())
+                render::render_slide(&document.paged, view, previous.slide.as_ref())
             });
         let render_ms = elapsed_ms(start);
-
-        let mut output = lock(&self.output);
-        output.served = id;
-        output.render_ms = render_ms;
-        output.document = document;
-        output.slide = slide;
-        if let Some(pages) = pages {
-            output.pages = pages;
-        }
-        if let Some((_, diagnostics, compile_ms)) = compiled {
-            output.diagnostics = diagnostics;
-            output.compile_ms = compile_ms;
-        }
+        let (diagnostics, compile_ms) = match compiled {
+            Some((_, diagnostics, compile_ms)) => (Arc::new(diagnostics), compile_ms),
+            None => (Arc::clone(&previous.diagnostics), previous.compile_ms),
+        };
+        *lock(&self.output) = Arc::new(Output {
+            served: id,
+            document,
+            pages,
+            slide,
+            diagnostics,
+            compile_ms,
+            render_ms,
+        });
     }
 }
 
@@ -428,7 +439,7 @@ mod tests {
 
     /// Wait for notifications until SESSION served request ID.
     fn wait_for(session: &Session, notifications: &Receiver<u8>, id: u64) {
-        while session.output().served < id {
+        while session.take_output().served < id {
             assert!(
                 notifications.recv_timeout(TIMEOUT).is_ok(),
                 "no notification"
@@ -456,9 +467,9 @@ mod tests {
         });
         wait_for(&session, &notifications, id);
         let first_pages = {
-            let output = session.output();
+            let output = session.take_output();
             assert_eq!(output.pages.len(), 2);
-            assert_eq!(output.diagnostics, []);
+            assert_eq!(*output.diagnostics, []);
             // 100pt fit into 200 - 2 * MARGIN px.
             assert_eq!(output.pages[0].width, 200);
             assert_eq!(output.pages[0].height, 84 + 2 * render::MARGIN as usize);
@@ -472,7 +483,7 @@ mod tests {
             slide: None,
         });
         wait_for(&session, &notifications, id);
-        let output = session.output();
+        let output = session.take_output();
         assert_eq!(output.count(Severity::Error), 1);
         assert_eq!(output.pages.len(), 2);
         assert!(
@@ -499,7 +510,7 @@ mod tests {
             slide: None,
         });
         wait_for(&session, &notifications, id);
-        let output = session.output();
+        let output = session.take_output();
         assert_eq!(output.pages.len(), 1);
         assert_eq!(output.pages[0].width, 300);
         Ok(())
@@ -526,7 +537,7 @@ mod tests {
             slide: None,
         });
         wait_for(&session, &notifications, id);
-        let output = session.output();
+        let output = session.take_output();
         let image = &output.pages[0];
         // The middle of the page has the theme's page color.
         assert_eq!(
@@ -553,7 +564,7 @@ mod tests {
         });
         wait_for(&session, &notifications, id);
         let first = {
-            let output = session.output();
+            let output = session.take_output();
             let image = output.slide.clone().ok_or("no slide")?;
             // The image fills the view. The page fits its width, centered vertically on black.
             assert_eq!((image.width, image.height), (400, 300));
@@ -569,7 +580,7 @@ mod tests {
             slide: Some(slide(5)),
         });
         wait_for(&session, &notifications, id);
-        let output = session.output();
+        let output = session.take_output();
         assert!(
             output
                 .slide
@@ -584,7 +595,7 @@ mod tests {
             slide: None,
         });
         wait_for(&session, &notifications, id);
-        assert!(session.output().slide.is_none());
+        assert!(session.take_output().slide.is_none());
         Ok(())
     }
 
@@ -607,8 +618,8 @@ mod tests {
                 }),
             });
             wait_for(&session, &notifications, id);
-            let output = session.output();
-            assert_eq!(output.diagnostics, [], "{text}");
+            let output = session.take_output();
+            assert_eq!(*output.diagnostics, [], "{text}");
             assert_eq!(output.pages.len(), 1, "{text}");
             assert!(output.slide.is_some(), "{text}");
         }
@@ -652,6 +663,39 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn shown_output_changes_only_when_taken() -> TestResult {
+        let (session, notifications) = start()?;
+        let page = "#set page(width: 100pt, height: 50pt)\n";
+        let id = session.request(Request {
+            text: Some(format!("{page}A")),
+            theme: None,
+            view: view(200),
+            slide: None,
+        });
+        wait_for(&session, &notifications, id);
+        let text = format!("{page}A\n#pagebreak()\nB");
+        let id = session.request(Request {
+            text: Some(text.clone()),
+            theme: None,
+            view: view(200),
+            slide: None,
+        });
+        // Wait for the newest output without taking it.
+        while lock(&session.shared.output).served < id {
+            notifications.recv_timeout(TIMEOUT)?;
+        }
+        // Until Lisp takes it, everything agrees with the 1-page output that it shows.
+        assert_eq!(session.shown().pages.len(), 1);
+        let cursor = find(&text, "B")?;
+        let (_, place) = session.set_caret(Some(cursor), 0);
+        assert!(place.as_ref().is_none_or(|place| place.page == 0), "{place:?}");
+        assert_eq!(session.take_output().pages.len(), 2);
+        let (_, place) = session.set_caret(Some(cursor), 0);
+        assert_eq!(place.map(|place| place.page), Some(1));
+        Ok(())
+    }
+
     /// Keep the session thread busy after its next compile, until the returned sender is dropped.
     /// The receiver gets a message when the thread is busy.
     fn block_after_compile(session: &Session) -> (Sender<()>, Receiver<()>) {
@@ -684,7 +728,7 @@ mod tests {
         });
         busy.recv_timeout(TIMEOUT)?;
 
-        let image = session.output().pages[0].clone();
+        let image = session.take_output().pages[0].clone();
         let (x, y) = image.pixel_at(Point::new(Abs::pt(10.5), Abs::pt(15.0)));
         assert_eq!(
             session.jump(0, x, y),
