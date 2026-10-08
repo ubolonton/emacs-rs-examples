@@ -433,6 +433,86 @@ Return the status."
       (typst-canvas-mode -1))
     (should-not (memq #'typst-canvas--on-theme-change enable-theme-functions))))
 
+;;;; Equation at point
+
+(defconst typst-canvas-test--equation
+  (concat typst-canvas-test--page "Text $x + y$ after\nNext")
+  "A buffer text with an inline equation in its first page line.")
+
+(defun typst-canvas-test--settle ()
+  "Wait until the session of the current buffer served the newest request."
+  (typst-canvas-test--wait
+   (lambda () (and typst-canvas--status (>= (car typst-canvas--status) typst-canvas--sent)))))
+
+(defun typst-canvas-test--equation-canvas ()
+  "Return the canvas that the equation overlay shows, or nil."
+  (when-let* ((overlay typst-canvas--equation-overlay)
+              (string (overlay-get overlay 'after-string)))
+    (get-text-property (1- (length string)) 'display string)))
+
+(defun typst-canvas-test--darkest (canvas)
+  "Return the smallest blue channel of the pixels of CANVAS."
+  (let ((darkest #xff))
+    (dotimes (y (image-property canvas :data-height))
+      (dotimes (x (image-property canvas :data-width))
+        (setq darkest (min darkest (logand (typst-canvas--canvas-pixel canvas x y) #xff)))))
+    darkest))
+
+(ert-deftest typst-canvas::equation-shows-below-its-line ()
+  (with-temp-buffer
+    (insert typst-canvas-test--equation)
+    (typst-canvas-mode 1)
+    (unwind-protect
+        (progn
+          (typst-canvas-test--settle)
+          (search-backward "+ y")
+          (typst-canvas--update-caret)
+          (let ((canvas (typst-canvas-test--equation-canvas)))
+            (should canvas)
+            ;; Right after the line of the equation.
+            (should (= (overlay-start typst-canvas--equation-overlay) (line-end-position)))
+            (should (string-prefix-p "\n" (overlay-get typst-canvas--equation-overlay
+                                                       'after-string)))
+            ;; The equation is cut out at the buffer text size, not as wide as a page.
+            (should (< 20 (image-property canvas :data-width) 200))
+            (should (< (typst-canvas-test--darkest canvas) #x40)))
+          ;; Out of the equation, it disappears.
+          (goto-char (point-max))
+          (typst-canvas--update-caret)
+          (should-not typst-canvas--equation-overlay)
+          (search-backward "+ y")
+          (let ((typst-canvas-inline-math nil))
+            (typst-canvas--update-caret)
+            (should-not typst-canvas--equation-overlay)))
+      (typst-canvas-mode -1))))
+
+(ert-deftest typst-canvas::equation-updates-while-typing ()
+  (with-temp-buffer
+    (insert typst-canvas-test--equation)
+    (typst-canvas-mode 1)
+    (unwind-protect
+        (progn
+          (typst-canvas-test--settle)
+          (search-backward "y$")
+          (forward-char)
+          (typst-canvas--update-caret)
+          (let* ((canvas (typst-canvas-test--equation-canvas))
+                 (width (image-property canvas :data-width)))
+            (insert " + z^2")
+            (typst-canvas-test--wait
+             (lambda () (> (image-property canvas :data-width) width)))
+            (should (< (typst-canvas-test--darkest canvas) #x40))
+            ;; An error inside the equation keeps the last image, dimmed.
+            (setq width (image-property canvas :data-width))
+            (insert " #nope")
+            (typst-canvas-test--wait (lambda () (> (nth 2 typst-canvas--status) 0)))
+            (should (eq (typst-canvas-test--equation-canvas) canvas))
+            (should (= (image-property canvas :data-width) width))
+            (should (> (typst-canvas-test--darkest canvas) #x80))
+            (should (nth 4 (typst-canvas--session-equation typst-canvas--session (1- (point))
+                                                           16.0 800)))))
+      (typst-canvas-mode -1))))
+
 ;;;; Demo
 
 (defun typst-canvas-test--showcase ()

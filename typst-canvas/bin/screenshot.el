@@ -7,6 +7,8 @@
 ;; 3. `modus-vivendi' (dark), loaded at run time, with theme matching.
 ;; 4. Right after a click on the caret's line: the jump target pulses in the source.
 ;; 5. Zoomed in, scrolled right.
+;; 6. Point in an equation: it shows rendered below its source line.
+;; 7. An error in that equation: the equation shows dimmed.
 
 (require 'cl-lib)
 (require 'typst-canvas)
@@ -129,6 +131,23 @@
          (typst-canvas-zoom-in)
          (typst-canvas-zoom-in)
          (typst-canvas-scroll-left 5))))
-    (lambda () (typst-canvas-screenshot--save "screenshot-5.png")))))
+    (lambda () (typst-canvas-screenshot--save "screenshot-5.png"))
+    (lambda ()
+      (typst-canvas-screenshot--in-preview #'typst-canvas-zoom-fit)
+      (with-current-buffer typst-canvas-screenshot--source
+        (typst-canvas-screenshot--move-caret "e^(-x")))
+    (lambda () (typst-canvas-screenshot--save "screenshot-6.png"))
+    (lambda ()
+      (with-current-buffer typst-canvas-screenshot--source
+        (search-forward "sqrt(pi)")
+        (insert " + #nope")))
+    (lambda ()
+      (with-current-buffer typst-canvas-screenshot--source
+        (typst-canvas--update-caret)))
+    (lambda () (typst-canvas-screenshot--save "screenshot-7.png"))
+    (lambda ()
+      (with-current-buffer typst-canvas-screenshot--source
+        (delete-region (- (point) (length " + #nope")) (point))
+        (set-buffer-modified-p nil))))))
 
 ;;; screenshot.el ends here

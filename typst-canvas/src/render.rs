@@ -13,6 +13,7 @@ use std::{
     thread,
 };
 
+use tiny_skia::Pixmap;
 use typst::{
     layout::{Abs, Point},
     utils::{Scalar, hash128},
@@ -48,8 +49,8 @@ const MIN_CARET_WIDTH: f64 = 2.0;
 const BAND_PADDING: f64 = 0.15;
 const BAND_OPACITY: f64 = 0.1;
 /// The largest page image, in pixels. Bounds memory use at high zoom.
-const MAX_PAGE_PIXELS: f64 = 16_000_000.0;
-const MIN_PIXEL_PER_PT: f64 = 0.05;
+pub const MAX_PAGE_PIXELS: f64 = 16_000_000.0;
+pub const MIN_PIXEL_PER_PT: f64 = 0.05;
 
 /// Serials are unique across sessions, so that Lisp can compare them without knowing where an
 /// image came from.
@@ -200,17 +201,47 @@ fn pixel_per_pt(pages: &[Page], view: View) -> f64 {
         });
     let available = f64::from(view.width.saturating_sub(2 * MARGIN).max(1));
     let fit = available / max_width * view.zoom;
-    let budget = (MAX_PAGE_PIXELS / max_area).sqrt();
+    clamp_scale(fit, max_area)
+}
+
+/// Return the scale FIT, but small enough that an area of AREA square points fits the pixel
+/// budget of a page image.
+pub fn clamp_scale(fit: f64, area: f64) -> f64 {
+    let budget = (MAX_PAGE_PIXELS / area).sqrt();
     // `max` last: it also replaces NaN, from empty pages.
     fit.min(budget).max(MIN_PIXEL_PER_PT)
 }
 
-fn render_page(page: &Page, pixel_per_pt: f64, view: View, key: Key) -> PageImage {
+/// Rasterize PAGE at PIXEL_PER_PT.
+pub fn rasterize(page: &Page, pixel_per_pt: f64) -> Pixmap {
     let options = RenderOptions {
         pixel_per_pt: Scalar::new(pixel_per_pt),
         render_bleed: false,
     };
-    let pixmap = typst_render::render(page, &options);
+    typst_render::render(page, &options)
+}
+
+/// Return the pixels of PIXMAP as `0xAARRGGBB`, on paper where it is transparent.
+pub fn opaque_pixels(pixmap: &Pixmap) -> Vec<u32> {
+    let (pixels, _) = pixmap.data().as_chunks::<4>();
+    pixels.iter().map(|rgba| over(*rgba, PAPER)).collect()
+}
+
+/// Copy PIXMAP onto PIXELS, whose rows are WIDTH long, at RECT, on paper where it is
+/// transparent.
+fn paint(pixels: &mut [u32], width: usize, rect: Rect, pixmap: &Pixmap) {
+    for (row_index, source) in pixmap.data().chunks_exact(4 * rect.width).enumerate() {
+        let start = (rect.y + row_index) * width + rect.x;
+        let row = &mut pixels[start..start + rect.width];
+        let (source_pixels, _) = source.as_chunks::<4>();
+        for (pixel, rgba) in row.iter_mut().zip(source_pixels) {
+            *pixel = over(*rgba, PAPER);
+        }
+    }
+}
+
+fn render_page(page: &Page, pixel_per_pt: f64, view: View, key: Key) -> PageImage {
+    let pixmap = rasterize(page, pixel_per_pt);
     let (page_width, page_height) = (pixmap.width() as usize, pixmap.height() as usize);
     let margin = MARGIN as usize;
     let width = (page_width + 2 * margin).max(view.width as usize);
@@ -225,16 +256,9 @@ fn render_page(page: &Page, pixel_per_pt: f64, view: View, key: Key) -> PageImag
         height: page_height,
     };
     decorate(&mut pixels, width, page, desk);
-    for (row_index, source) in pixmap.data().chunks_exact(4 * page_width).enumerate() {
-        let start = (page_y + row_index) * width + page_x;
-        let row = &mut pixels[start..start + page_width];
-        let (source_pixels, _) = source.as_chunks::<4>();
-        for (pixel, rgba) in row.iter_mut().zip(source_pixels) {
-            *pixel = over(*rgba, PAPER);
-        }
-    }
+    paint(&mut pixels, width, page, &pixmap);
     PageImage {
-        serial: NEXT_SERIAL.fetch_add(1, Ordering::Relaxed),
+        serial: next_serial(),
         width,
         height,
         pixels,
@@ -242,6 +266,11 @@ fn render_page(page: &Page, pixel_per_pt: f64, view: View, key: Key) -> PageImag
         pixel_per_pt,
         key,
     }
+}
+
+/// Return a new serial for an image. Serials are unique across sessions and image kinds.
+pub fn next_serial() -> u64 {
+    NEXT_SERIAL.fetch_add(1, Ordering::Relaxed)
 }
 
 /// Return the pixel rows of the line band of CARET in IMAGE.
@@ -273,13 +302,26 @@ pub fn draw_caret(buffer: &mut [u32], image: &PageImage, caret: &Caret, color: u
         }
     }
     let (x, baseline) = image.pixel_at(caret.point);
-    let size = caret.size.to_pt() * image.pixel_per_pt;
+    draw_bar(
+        buffer,
+        width,
+        x,
+        baseline,
+        caret.size.to_pt() * image.pixel_per_pt,
+        color,
+    );
+}
+
+/// Draw a caret bar in the opaque `0xAARRGGBB` COLOR onto BUFFER, whose rows are WIDTH long: at
+/// column X, for text of SIZE pixels whose baseline is at row BASELINE.
+pub fn draw_bar(buffer: &mut [u32], width: usize, x: f64, baseline: f64, size: f64, color: u32) {
+    let height = buffer.len() / width.max(1);
     let bar_width = (CARET_WIDTH * size).max(MIN_CARET_WIDTH).round();
     let left = (x - bar_width / 2.0).round().max(0.0) as usize;
     let columns = left.min(width)..(left + bar_width as usize).min(width);
     let top = (baseline - CARET_ASCENT * size).round().max(0.0) as usize;
     let bottom = (baseline + CARET_DESCENT * size).round().max(0.0) as usize;
-    for y in top.min(image.height)..bottom.min(image.height) {
+    for y in top.min(height)..bottom.min(height) {
         buffer[y * width + columns.start..y * width + columns.end].fill(color);
     }
 }
@@ -348,7 +390,7 @@ fn luminance(color: u32) -> f64 {
 }
 
 /// Mix the opaque `0xAARRGGBB` colors TOP over BOTTOM, with TOP at OPACITY (0 to 1).
-fn mix(top: u32, bottom: u32, opacity: f64) -> u32 {
+pub fn mix(top: u32, bottom: u32, opacity: f64) -> u32 {
     let channel = |shift: u32| {
         let (top, bottom) = (
             f64::from((top >> shift) & 0xFF),

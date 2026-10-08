@@ -7,7 +7,8 @@
 ;; `typst-canvas-mode' in a Typst buffer shows a live preview in another window.  A Rust thread
 ;; compiles the buffer text and renders the pages.  When a result is ready, the thread writes to a
 ;; pipe process.  The process filter copies the changed pages into canvas images, one per page.
-;; Diagnostics go to Flymake.
+;; Diagnostics go to Flymake.  While point is in an equation, the equation shows rendered below
+;; its source line.
 
 ;;; Code:
 
@@ -64,6 +65,22 @@ Documents that set their own page or text colors keep them.  Toggle it
 in a preview with `typst-canvas-toggle-theme'."
   :type 'boolean)
 
+(defcustom typst-canvas-inline-math t
+  "If non-nil, the equation at point shows rendered below its source line.
+It is cut out of the last good compile, so it has the document's styles.
+While the text does not compile, it shows dimmed."
+  :type 'boolean)
+
+(defcustom typst-canvas-inline-math-scale 1.25
+  "Size of the equation below its source line, relative to the buffer text.
+1 gives the equation's font the size of the `default' face.  Math fonts
+have smaller lowercase letters than most code fonts, so the default is
+larger."
+  :type 'number)
+
+(defconst typst-canvas--fallback-text-size 16
+  "Font size of the `default' face in pixels, if no graphical frame shows it.")
+
 (defconst typst-canvas--fallback-desk "#808080"
   "Desk color if the `default' face has no known background, e.g. in batch mode.")
 
@@ -84,6 +101,9 @@ Without it, pages that match the theme would not stand out from the desk.")
 (defvar-local typst-canvas--started-flymake nil "Non-nil if this mode turned on Flymake.")
 (defvar-local typst-canvas--caret-timer nil "Timer that moves the caret.")
 (defvar-local typst-canvas--caret-point nil "Point that the caret shows, or nil.")
+(defvar-local typst-canvas--updated-point nil "Point at the last update of caret and equation.")
+(defvar-local typst-canvas--equation-overlay nil "Overlay that shows the equation at point.")
+(defvar-local typst-canvas--equation-canvas nil "Canvas image spec of the equation at point.")
 
 ;;;; State of the preview buffer
 
@@ -150,7 +170,10 @@ Without it, pages that match the theme would not stand out from the desk.")
   (when typst-canvas--caret-timer
     (cancel-timer typst-canvas--caret-timer)
     (setq typst-canvas--caret-timer nil))
-  (setq typst-canvas--caret-point nil)
+  (setq typst-canvas--caret-point nil
+        typst-canvas--updated-point nil)
+  (typst-canvas--hide-equation)
+  (setq typst-canvas--equation-canvas nil)
   ;; Stop the thread before deleting the process: in batch mode, Emacs does not ignore SIGPIPE,
   ;; so a write to a deleted pipe kills Emacs.
   (when typst-canvas--session
@@ -271,7 +294,7 @@ or the face colors are unknown."
                 (pages (nth 1 typst-canvas--status)))
             (with-current-buffer typst-canvas--preview
               (typst-canvas--show-pages session pages))))
-        ;; The pages changed, so the caret can be elsewhere.
+        ;; The pages changed, so the caret and the equation can be elsewhere.
         (typst-canvas--update-caret)
         (typst-canvas--report-diagnostics)
         (force-mode-line-update t)))))
@@ -527,8 +550,10 @@ See `typst-canvas-match-theme'."
 ;;;; Forward sync: from the source cursor to a caret on a page
 
 (defun typst-canvas--on-post-command ()
-  "Move the caret after point stays still for `typst-canvas--follow-delay'."
-  (unless (eql (and typst-canvas-follow-cursor (point)) typst-canvas--caret-point)
+  "Move the caret, and update the equation at point.
+Do it after point stays still for `typst-canvas--follow-delay'."
+  (unless (and (eql (point) typst-canvas--updated-point)
+               (eql (and typst-canvas-follow-cursor (point)) typst-canvas--caret-point))
     (when typst-canvas--caret-timer
       (cancel-timer typst-canvas--caret-timer))
     (setq typst-canvas--caret-timer
@@ -545,10 +570,12 @@ See `typst-canvas-match-theme'."
 
 (defun typst-canvas--update-caret ()
   "Show point as the caret in the preview, and scroll to it if it is out of view.
-Hide the caret if `typst-canvas-follow-cursor' is nil."
+Hide the caret if `typst-canvas-follow-cursor' is nil.  Then update the
+equation at point, which shows the caret too."
   (let ((cursor (and typst-canvas-follow-cursor (point)))
         (session typst-canvas--session))
-    (setq typst-canvas--caret-point cursor)
+    (setq typst-canvas--caret-point cursor
+          typst-canvas--updated-point (point))
     (pcase-let ((`(,old ,new ,top ,bottom)
                  (typst-canvas--session-set-caret
                   session (and cursor (1- cursor))
@@ -561,7 +588,8 @@ Hide the caret if `typst-canvas-follow-cursor' is nil."
             (when (< page (length typst-canvas--canvases))
               (typst-canvas--present session page)))
           (when new
-            (typst-canvas--scroll-to-caret new top bottom)))))))
+            (typst-canvas--scroll-to-caret new top bottom)))))
+    (typst-canvas--update-equation)))
 
 (defun typst-canvas--scroll-to-caret (page top bottom)
   "Scroll to pixel rows TOP to BOTTOM of PAGE, if they are not visible."
@@ -577,6 +605,66 @@ Hide the caret if `typst-canvas-follow-cursor' is nil."
     (`(,_x ,_y ,hidden-top ,hidden-bottom . ,_)
      (and (>= top hidden-top)
           (<= bottom (- (typst-canvas--page-height page) hidden-bottom))))))
+
+;;;; Equation at point
+
+(defun typst-canvas--update-equation ()
+  "Show the equation at point below its last source line, or hide it.
+Do nothing while a request is pending: its result calls this again."
+  (cond
+   ((not typst-canvas-inline-math)
+    (typst-canvas--hide-equation))
+   ((and typst-canvas--status (>= (car typst-canvas--status) typst-canvas--sent))
+    (pcase (typst-canvas--session-equation typst-canvas--session (1- (point))
+                                           (typst-canvas--equation-px-per-em)
+                                           (typst-canvas--equation-max-width))
+      (`(,end ,_serial ,width ,height ,_stale)
+       (typst-canvas--show-equation end width height))
+      (_ (typst-canvas--hide-equation))))))
+
+(defun typst-canvas--show-equation (end width height)
+  "Show the equation image, WIDTH x HEIGHT, below the line of position END."
+  (let ((canvas (or typst-canvas--equation-canvas
+                    (setq typst-canvas--equation-canvas
+                          (list 'image :type 'canvas
+                                :id (make-symbol "typst-canvas-equation")
+                                :data-width 1 :data-height 1))))
+        (eol (save-excursion
+               (goto-char end)
+               (line-end-position))))
+    (plist-put (cdr canvas) :data-width width)
+    (plist-put (cdr canvas) :data-height height)
+    (when (typst-canvas--present-equation typst-canvas--session canvas)
+      (if typst-canvas--equation-overlay
+          (move-overlay typst-canvas--equation-overlay eol eol)
+        ;; Front advance: text typed at the end of the line goes before the image.
+        (setq typst-canvas--equation-overlay (make-overlay eol eol nil t nil)))
+      ;; With point at the end of the line, `cursor' keeps the cursor there, not after the image.
+      ;; Setting the string again makes redisplay see a resized canvas.
+      (overlay-put typst-canvas--equation-overlay 'after-string
+                   (concat (propertize "\n" 'cursor t)
+                           (propertize " " 'display canvas))))))
+
+(defun typst-canvas--hide-equation ()
+  "Hide the equation at point."
+  (when typst-canvas--equation-overlay
+    (delete-overlay typst-canvas--equation-overlay)
+    (setq typst-canvas--equation-overlay nil)))
+
+(defun typst-canvas--equation-px-per-em ()
+  "Return the font size of the equation at point, in pixels, as a float."
+  (* 1.0 typst-canvas-inline-math-scale
+     (let ((font (and (display-graphic-p) (face-font 'default))))
+       (or (and font (aref (font-info font) 2))
+           typst-canvas--fallback-text-size))))
+
+(defun typst-canvas--equation-max-width ()
+  "Return the width limit of the equation at point, in pixels."
+  (let ((window (get-buffer-window (current-buffer) t)))
+    (if (and window (display-graphic-p (window-frame window)))
+        (max 1 (- (window-body-width window t)
+                  (* 2 (frame-char-width (window-frame window)))))
+      typst-canvas-default-width)))
 
 ;;;; Backward sync: from a page to the source
 

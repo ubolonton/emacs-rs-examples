@@ -13,6 +13,8 @@ typst = "0.15"
 typst-layout = "0.15"
 typst-render = "0.15"
 typst-ide = "0.15"
+# The pixmap type of `typst-render`, which does not re-export it.
+tiny-skia = "0.12"
 typst-kit = { version = "0.15", features = [
     "datetime",
     "embedded-fonts",

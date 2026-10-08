@@ -4,6 +4,7 @@
 //! defuns below run on the Lisp thread. They copy finished page images into canvases. Only they
 //! touch canvas memory, and only inside `with_canvas_data`.
 
+mod math;
 mod offset;
 mod render;
 mod session;
@@ -16,6 +17,7 @@ use emacs::{Env, Result, Value, defun};
 use typst::diag::Severity;
 
 use crate::{
+    math::EquationView,
     render::View,
     session::{Request, Session},
     sync::Target,
@@ -225,6 +227,75 @@ fn present_page(env: &Env, session: &Session, index: usize, canvas: Value<'_>) -
         if let Some((caret, color)) = caret {
             render::draw_caret(data.buffer, &image, &caret, color);
         }
+        true
+    })?;
+    if copied {
+        env.call("canvas-refresh", [canvas])?;
+    }
+    Ok(copied)
+}
+
+/// Return the equation of SESSION that encloses char offset CURSOR (0-based) of the newest text
+/// sent, as (END SERIAL WIDTH HEIGHT STALE), or nil if there is none, or it has no image yet.
+///
+/// END is the buffer position right after the equation. The image shows the equation with
+/// PX-PER-EM pixels per em of its font, at most MAX-WIDTH pixels wide, with the caret of the last
+/// `typst-canvas--session-set-caret'. STALE is non-nil if the newest text did not compile: the
+/// image is from the last good compile, and `typst-canvas--present-equation' dims it.
+#[defun]
+fn session_equation<'e>(
+    env: &'e Env,
+    session: &Session,
+    cursor: usize,
+    px_per_em: f64,
+    max_width: usize,
+) -> Result<Option<Value<'e>>> {
+    let view = EquationView {
+        px_per_em,
+        max_width,
+    };
+    session
+        .equation(cursor, view)
+        .map(|place| {
+            env.list((
+                place.end + 1,
+                place.image.serial,
+                place.image.width,
+                place.image.height,
+                place.stale,
+            ))
+        })
+        .transpose()
+}
+
+/// Copy the equation of the last `typst-canvas--session-equation' call into CANVAS, dimmed if it
+/// is stale, and refresh CANVAS. Return non-nil if CANVAS had the size of the image.
+#[defun]
+fn present_equation(env: &Env, session: &Session, canvas: Value<'_>) -> Result<bool> {
+    let Some((image, stale)) = session.equation_image() else {
+        return Ok(false);
+    };
+    if stale {
+        copy_into(env, canvas, image.width, image.height, &image.dimmed())
+    } else {
+        copy_into(env, canvas, image.width, image.height, &image.pixels)
+    }
+}
+
+/// Copy PIXELS, WIDTH x HEIGHT, into CANVAS, and refresh it. Return false, and copy nothing, if
+/// CANVAS has another size.
+fn copy_into(
+    env: &Env,
+    canvas: Value<'_>,
+    width: usize,
+    height: usize,
+    pixels: &[u32],
+) -> Result<bool> {
+    let copied = canvas.with_canvas_data(|data| {
+        if data.width != width || data.height != height {
+            return false;
+        }
+        data.buffer.copy_from_slice(pixels);
         true
     })?;
     if copied {

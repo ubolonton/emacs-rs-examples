@@ -14,9 +14,10 @@ use std::{
     time::Instant,
 };
 
-use typst::{diag::Severity, layout::Point};
+use typst::{diag::Severity, layout::Point, syntax::Source};
 
 use crate::{
+    math::{self, EquationImage, EquationView},
     offset,
     render::{self, PageImage, View},
     sync::{self, Caret, Target},
@@ -83,6 +84,20 @@ pub struct Session {
     thread: Option<JoinHandle<()>>,
     /// The caret and its color (`0xRRGGBB`). Only the Lisp thread uses it, to draw onto canvases.
     caret: Mutex<Option<(Caret, u32)>>,
+    /// The newest text sent, parsed. Only the Lisp thread uses it, to find the equation at the
+    /// cursor in the text that the buffer has now, also while that text does not compile.
+    text: Mutex<Source>,
+    /// The equation at the cursor, and whether it is stale (from an older text). Lisp thread only.
+    equation: Mutex<Option<(Arc<EquationImage>, bool)>>,
+}
+
+/// The equation at the cursor, for Lisp.
+pub struct EquationPlace {
+    /// Char offset of the end of the equation, in the newest text.
+    pub end: usize,
+    pub image: Arc<EquationImage>,
+    /// True if the image is from an older text, because the newest one did not compile.
+    pub stale: bool,
 }
 
 /// Where the caret is on its page image.
@@ -113,11 +128,17 @@ impl Session {
             shared,
             thread: Some(thread),
             caret: Mutex::default(),
+            text: Mutex::new(Source::detached(String::new())),
+            equation: Mutex::default(),
         })
     }
 
     /// Queue REQUEST, replacing an unserved one. Return its ID.
     pub fn request(&self, request: Request) -> u64 {
+        if let Some(text) = &request.text {
+            // An incremental reparse: usually cheaper than the copy of the text.
+            lock(&self.text).replace(text);
+        }
         let mut slot = lock(&self.shared.slot);
         slot.last_id += 1;
         let id = slot.last_id;
@@ -176,6 +197,53 @@ impl Session {
     /// Return the caret and its color, if it is on page INDEX.
     pub fn caret_on(&self, index: usize) -> Option<(Caret, u32)> {
         lock(&self.caret).filter(|(caret, _)| caret.page == index)
+    }
+
+    /// Return the equation that encloses char offset CURSOR of the newest text, rendered for VIEW,
+    /// or `None` if there is none, or it has no image yet.
+    ///
+    /// If the last good document has the newest text, render the equation from it, with the caret.
+    /// Else keep the image of the last call, as stale, if it shows an equation at the same offset.
+    pub fn equation(&self, cursor: usize, view: EquationView) -> Option<EquationPlace> {
+        let text = lock(&self.text);
+        let byte = offset::char_to_byte(text.text(), cursor);
+        let Some((start, end)) =
+            math::equation_at(&text, byte).map(|node| (node.offset(), node.offset() + node.len()))
+        else {
+            *lock(&self.equation) = None;
+            return None;
+        };
+        let end = offset::byte_to_char(text.text(), end);
+        let document = self.output().document.clone();
+        let fresh = document.filter(|document| document.source.text() == text.text());
+        drop(text);
+
+        let mut equation = lock(&self.equation);
+        match fresh {
+            Some(document) => {
+                let image = math::equation_at(&document.source, byte)
+                    .and_then(|node| math::cut_out(&document.paged, node.span()))
+                    .map(|cutout| {
+                        let page = &document.paged.pages()[cutout.page];
+                        math::render(page, &cutout, view, start, self.caret_on(cutout.page))
+                    });
+                *equation = image.map(|image| (Arc::new(image), false));
+            }
+            None => match equation.as_mut() {
+                Some((image, stale)) if image.start == start => *stale = true,
+                _ => *equation = None,
+            },
+        }
+        equation.as_ref().map(|(image, stale)| EquationPlace {
+            end,
+            image: Arc::clone(image),
+            stale: *stale,
+        })
+    }
+
+    /// Return the image of the last `equation` call, and whether it is stale.
+    pub fn equation_image(&self) -> Option<(Arc<EquationImage>, bool)> {
+        lock(&self.equation).clone()
     }
 
     /// Return the pixel row of the page point POINT in the image of page INDEX.
@@ -433,6 +501,41 @@ mod tests {
             image.pixels[image.height / 2 * image.width + image.width / 2],
             0xFF00_0000
         );
+    }
+
+    #[test]
+    fn equation_goes_stale_while_text_fails() {
+        let (session, notifications) = start();
+        let equation_view = EquationView {
+            px_per_em: 16.0,
+            max_width: 500,
+        };
+        let serve = |text: &str| {
+            let id = session.request(Request {
+                text: Some(text.into()),
+                theme: None,
+                view: view(200),
+            });
+            wait_for(&session, &notifications, id);
+        };
+        let good = "#set page(width: 100pt, height: 50pt)\nA $x + y$ B";
+        serve(good);
+        let cursor = good.find('x').unwrap_or_default();
+        let Some(fresh) = session.equation(cursor, equation_view) else {
+            panic!("no equation");
+        };
+        assert!(!fresh.stale);
+        assert_eq!(fresh.end, good.find(" B").unwrap_or_default());
+        // Outside the equation, there is none.
+        assert!(session.equation(good.len(), equation_view).is_none());
+        session.equation(cursor, equation_view);
+        // An error inside the equation keeps the last image, as stale.
+        serve("#set page(width: 100pt, height: 50pt)\nA $x + #nope$ B");
+        let Some(stale) = session.equation(cursor, equation_view) else {
+            panic!("no stale equation");
+        };
+        assert!(stale.stale);
+        assert_eq!(stale.end, fresh.end + "#nope".len() - "y".len());
     }
 
     #[test]
