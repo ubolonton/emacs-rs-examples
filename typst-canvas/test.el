@@ -1,6 +1,7 @@
 ;;; test.el --- Tests for typst-canvas -*- lexical-binding: t -*-
 
 (require 'typst-canvas)
+(require 'typst-canvas-demo)
 (require 'cl-lib)
 (require 'ert)
 
@@ -431,5 +432,54 @@ Return the status."
           (should (memq #'typst-canvas--on-theme-change enable-theme-functions)))
       (typst-canvas-mode -1))
     (should-not (memq #'typst-canvas--on-theme-change enable-theme-functions))))
+
+;;;; Demo
+
+(defun typst-canvas-test--showcase ()
+  "Return the text of examples/showcase.typ."
+  (with-temp-buffer
+    (insert-file-contents (expand-file-name "examples/showcase.typ" typst-canvas-test--root))
+    (buffer-string)))
+
+(ert-deftest typst-canvas::demo-stops-on-input ()
+  (let ((original (typst-canvas-test--showcase))
+        (typst-canvas-demo-speed 10))
+    (typst-canvas-demo)
+    (let ((buffer (get-buffer typst-canvas-demo--buffer-name)))
+      (unwind-protect
+          (with-current-buffer buffer
+            (should typst-canvas-mode)
+            (should-not buffer-file-name)
+            (typst-canvas-test--wait (lambda () (> (buffer-size) (length original))))
+            ;; Any command stops the typing.  The buffer keeps its text and its preview.
+            (run-hooks 'pre-command-hook)
+            (should-not typst-canvas-demo--timer)
+            (should-not (memq #'typst-canvas-demo-stop pre-command-hook))
+            (let ((text (buffer-string)))
+              (accept-process-output nil 0.3)
+              (should (equal (buffer-string) text)))
+            (should typst-canvas-mode))
+        (kill-buffer buffer)))
+    (should (equal (typst-canvas-test--showcase) original))))
+
+(ert-deftest typst-canvas::demo-runs-to-end ()
+  (let ((typst-canvas-demo-speed 1000)
+        (themes custom-enabled-themes))
+    (typst-canvas-demo)
+    (let ((buffer (get-buffer typst-canvas-demo--buffer-name)))
+      (unwind-protect
+          (with-current-buffer buffer
+            (typst-canvas-test--wait (lambda () (null typst-canvas-demo--buffer)))
+            (should (string-search "[*Total*], [From key press to screen], [*25 ms*],"
+                                   (buffer-string)))
+            ;; The equation was typed with its closers once each.
+            (should (string-search "\n$ sum_(n=1)^oo 1/n^2 = pi^2/6 $\n" (buffer-string)))
+            (typst-canvas-test--wait #'typst-canvas-demo--preview-ready-p)
+            (should (= (nth 2 typst-canvas--status) 0))
+            (should (equal custom-enabled-themes themes))
+            (should (= (buffer-local-value 'typst-canvas--zoom typst-canvas--preview) 1.0))
+            (should-not (memq #'typst-canvas-demo-stop pre-command-hook)))
+        (typst-canvas-demo-stop)
+        (kill-buffer buffer)))))
 
 ;;; test.el ends here

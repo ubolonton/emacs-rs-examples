@@ -64,6 +64,14 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
 - Canvas specs get an uninterned `:id`: Emacs finds canvases by `eq` spec, but its image cache matches specs by `equal`. Resize: `plist-put` of `:data-width`/`:data-height` on the same spec.
 - Flymake reports pass the whole buffer as `:region`, so each report replaces the last one. Without it, reports after the first in one Flymake check only add diagnostics, and a fixed error stays marked until the next check (after idle time).
 
+## Demo (`typst-canvas-demo.el`)
+
+`typst-canvas-demo` (autoloaded from `typst-canvas.el`) opens `examples/showcase.typ` in a buffer that does not visit the file, turns on the mode, and runs a script of steps from timers: `type` (one char per step, jittered delay, longer after words and sentences), `snippet`, `goto`, `pause`, theme switch and restore, zoom.
+
+- Typed text stays valid Typst while it grows, so most keys update the preview: `(`, `[` and `*` are typed with their closer (like `electric-pair-mode`), display math starts as the snippet `$  $`, and the table row goes after the last table argument, where no comma is missing.
+- Timers do not run `post-command-hook`, so each step calls `typst-canvas--on-post-command` to move the caret.
+- Any command stops it (`pre-command-hook`), and so does killing its buffer. Stopping restores the themes from before the switch, and keeps the buffer and the mode.
+- `typst-canvas-demo-speed` scales all delays; the tests run the whole script at speed 1000.
 
 ## Testing
 

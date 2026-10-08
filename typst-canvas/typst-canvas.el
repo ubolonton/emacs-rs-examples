@@ -693,5 +693,10 @@ See `typst-canvas--scroll-fraction'."
   (interactive "p" typst-canvas-preview-mode)
   (typst-canvas--goto-page (- (typst-canvas--current-page) (or count 1))))
 
+;;;; Demo
+
+(autoload 'typst-canvas-demo "typst-canvas-demo"
+  "Show `typst-canvas-mode' on a showcase document that types itself." t)
+
 (provide 'typst-canvas)
 ;;; typst-canvas.el ends here
