@@ -13,12 +13,12 @@ mod world;
 
 use std::path::Path;
 
-use emacs::{Env, Result, Value, defun};
+use emacs::{Env, Result, Value, Vector, defun};
 use typst::diag::Severity;
 
 use crate::{
     math::EquationView,
-    render::View,
+    render::{SlideView, View},
     session::{Request, Session},
     sync::Target,
     world::{PreviewWorld, Theme},
@@ -51,7 +51,9 @@ fn session_start(env: &Env, root: String, main: String, notify: Value<'_>) -> Re
 /// TEXT is the new text of the main file, or nil to only re-render the last good document. WIDTH
 /// is the preview window body width in pixels. ZOOM is a factor relative to fit-width. DESK is the
 /// color around pages. PAGE and INK are the default page and text colors, or nil for Typst's
-/// defaults. Colors are #xRRGGBB.
+/// defaults. Colors are #xRRGGBB. SLIDE is nil, or [PAGE WIDTH HEIGHT] to also render page PAGE
+/// (0-based) as large as fits WIDTH x HEIGHT pixels, for a presentation.
+#[expect(clippy::too_many_arguments)]
 #[defun]
 fn session_request(
     session: &Session,
@@ -61,12 +63,23 @@ fn session_request(
     desk: u32,
     page: Option<u32>,
     ink: Option<u32>,
+    slide: Option<Vector<'_>>,
 ) -> Result<u64> {
     let theme = page.zip(ink).map(|(page, text)| Theme { page, text });
+    let slide = slide
+        .map(|slide| -> Result<SlideView> {
+            Ok(SlideView {
+                page: slide.get(0)?,
+                width: slide.get(1)?,
+                height: slide.get(2)?,
+            })
+        })
+        .transpose()?;
     Ok(session.request(Request {
         text,
         theme,
         view: View { width, zoom, desk },
+        slide,
     }))
 }
 
@@ -233,6 +246,27 @@ fn present_page(env: &Env, session: &Session, index: usize, canvas: Value<'_>) -
         env.call("canvas-refresh", [canvas])?;
     }
     Ok(copied)
+}
+
+/// Return (SERIAL WIDTH HEIGHT) of the slide of SESSION, or nil if the newest request did not ask
+/// for one. SERIAL changes when the image changes.
+#[defun]
+fn slide_info<'e>(env: &'e Env, session: &Session) -> Result<Option<Value<'e>>> {
+    let slide = session.output().slide.clone();
+    slide
+        .map(|image| env.list((image.serial, image.width, image.height)))
+        .transpose()
+}
+
+/// Copy the slide of SESSION into CANVAS, and refresh CANVAS. Return non-nil if CANVAS had the
+/// size of the slide.
+#[defun]
+fn present_slide(env: &Env, session: &Session, canvas: Value<'_>) -> Result<bool> {
+    let slide = session.output().slide.clone();
+    let Some(image) = slide else {
+        return Ok(false);
+    };
+    copy_into(env, canvas, image.width, image.height, &image.pixels)
 }
 
 /// Return the equation of SESSION that encloses char offset CURSOR (0-based) of the newest text

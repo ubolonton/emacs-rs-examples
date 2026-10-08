@@ -19,7 +19,7 @@ use typst::{diag::Severity, layout::Point, syntax::Source};
 use crate::{
     math::{self, EquationImage, EquationView},
     offset,
-    render::{self, PageImage, View},
+    render::{self, PageImage, SlideView, View},
     sync::{self, Caret, Target},
     world::{Compiled, Diagnostic, Document, PreviewWorld, Theme},
 };
@@ -36,6 +36,8 @@ pub struct Request {
     /// Default colors. A change compiles the document again, also without new text.
     pub theme: Option<Theme>,
     pub view: View,
+    /// The page to render as a slide, while a presentation shows.
+    pub slide: Option<SlideView>,
 }
 
 /// The newest result of the thread. Lisp reads it after a notification.
@@ -47,6 +49,8 @@ pub struct Output {
     pub document: Option<Arc<Document>>,
     /// Images of the pages of `document`.
     pub pages: Vec<Arc<PageImage>>,
+    /// The slide of the newest request that asked for one.
+    pub slide: Option<Arc<PageImage>>,
     /// Diagnostics of the newest compile, also if it failed.
     pub diagnostics: Vec<Diagnostic>,
     pub compile_ms: f64,
@@ -326,23 +330,31 @@ impl Shared {
 
         // Only this thread writes the output, so it does not change while we render without the
         // lock.
-        let (document, previous) = {
+        let (document, previous, previous_slide) = {
             let output = lock(&self.output);
             (
                 new_document.or_else(|| output.document.clone()),
                 output.pages.clone(),
+                output.slide.clone(),
             )
         };
         let start = Instant::now();
         let pages = document
             .as_ref()
             .map(|document| render::render_pages(&document.paged, request.view, &previous));
+        let slide = document
+            .as_ref()
+            .zip(request.slide)
+            .and_then(|(document, view)| {
+                render::render_slide(&document.paged, view, previous_slide.as_ref())
+            });
         let render_ms = elapsed_ms(start);
 
         let mut output = lock(&self.output);
         output.served = id;
         output.render_ms = render_ms;
         output.document = document;
+        output.slide = slide;
         if let Some(pages) = pages {
             output.pages = pages;
         }
@@ -428,6 +440,7 @@ mod tests {
             text,
             theme: None,
             view: view(200),
+            slide: None,
         });
         wait_for(&session, &notifications, id);
         let first_pages = {
@@ -444,6 +457,7 @@ mod tests {
             text: Some("#nope".into()),
             theme: None,
             view: view(200),
+            slide: None,
         });
         wait_for(&session, &notifications, id);
         let output = session.output();
@@ -463,11 +477,13 @@ mod tests {
             text,
             theme: None,
             view: view(200),
+            slide: None,
         });
         let id = session.request(Request {
             text: None,
             theme: None,
             view: view(300),
+            slide: None,
         });
         wait_for(&session, &notifications, id);
         let output = session.output();
@@ -483,6 +499,7 @@ mod tests {
             text,
             theme: None,
             view: view(200),
+            slide: None,
         });
         wait_for(&session, &notifications, id);
         let id = session.request(Request {
@@ -492,6 +509,7 @@ mod tests {
                 text: 0xFF_FFFF,
             }),
             view: view(200),
+            slide: None,
         });
         wait_for(&session, &notifications, id);
         let output = session.output();
@@ -501,6 +519,59 @@ mod tests {
             image.pixels[image.height / 2 * image.width + image.width / 2],
             0xFF00_0000
         );
+    }
+
+    #[test]
+    fn slide_fits_page_into_view() {
+        let (session, notifications) = start();
+        let text = Some("#set page(width: 160pt, height: 90pt)\nA\n#pagebreak()\nB".into());
+        let slide = |page| SlideView {
+            page,
+            width: 400,
+            height: 300,
+        };
+        let id = session.request(Request {
+            text,
+            theme: None,
+            view: view(200),
+            slide: Some(slide(1)),
+        });
+        wait_for(&session, &notifications, id);
+        let first = {
+            let output = session.output();
+            let Some(image) = output.slide.clone() else {
+                panic!("no slide");
+            };
+            // The image fills the view. The page fits its width, centered vertically on black.
+            assert_eq!((image.width, image.height), (400, 300));
+            assert_eq!((image.page.width, image.page.height), (400, 225));
+            assert_eq!(image.pixels[0], 0xFF00_0000);
+            image
+        };
+        // The same slide again is not rendered again. A page past the end shows the last one.
+        let id = session.request(Request {
+            text: None,
+            theme: None,
+            view: view(200),
+            slide: Some(slide(5)),
+        });
+        wait_for(&session, &notifications, id);
+        let output = session.output();
+        assert!(
+            output
+                .slide
+                .as_ref()
+                .is_some_and(|image| Arc::ptr_eq(image, &first))
+        );
+        drop(output);
+        let id = session.request(Request {
+            text: None,
+            theme: None,
+            view: view(200),
+            slide: None,
+        });
+        wait_for(&session, &notifications, id);
+        assert!(session.output().slide.is_none());
     }
 
     #[test]
@@ -515,6 +586,7 @@ mod tests {
                 text: Some(text.into()),
                 theme: None,
                 view: view(200),
+                slide: None,
             });
             wait_for(&session, &notifications, id);
         };
@@ -545,6 +617,7 @@ mod tests {
             text: Some("A".into()),
             theme: None,
             view: view(200),
+            slide: None,
         });
         session.stop();
         assert!(session.thread.is_none());

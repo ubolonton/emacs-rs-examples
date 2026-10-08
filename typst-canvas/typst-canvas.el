@@ -8,7 +8,7 @@
 ;; compiles the buffer text and renders the pages.  When a result is ready, the thread writes to a
 ;; pipe process.  The process filter copies the changed pages into canvas images, one per page.
 ;; Diagnostics go to Flymake.  While point is in an equation, the equation shows rendered below
-;; its source line.
+;; its source line.  `typst-canvas-present' shows the pages as slides.
 
 ;;; Code:
 
@@ -78,6 +78,33 @@ have smaller lowercase letters than most code fonts, so the default is
 larger."
   :type 'number)
 
+(defcustom typst-canvas-present-frame t
+  "If non-nil, `typst-canvas-present' shows slides in a new fullscreen frame.
+Otherwise, it shows them in the selected window, alone in its frame."
+  :type 'boolean)
+
+(defconst typst-canvas--present-frame-parameters
+  '((name . "typst-canvas presentation")
+    (fullscreen . fullboth)
+    (menu-bar-lines . 0)
+    (tool-bar-lines . 0)
+    (tab-bar-lines . 0)
+    (vertical-scroll-bars . nil)
+    (horizontal-scroll-bars . nil)
+    (left-fringe . 8)
+    (right-fringe . 8)
+    (internal-border-width . 0)
+    (background-color . "black")
+    (foreground-color . "gray60")
+    (unsplittable . t))
+  "Frame parameters of a presentation frame.
+The right fringe holds the end of the slide line.  Without it, Emacs keeps
+the last text column for the end of the line, and cuts the slide.  The
+left fringe keeps the slide centered.  Both are black.")
+
+(defconst typst-canvas--present-aspect (/ 9.0 16)
+  "Height to width ratio of a presentation without a graphical window.")
+
 (defconst typst-canvas--fallback-text-size 16
   "Font size of the `default' face in pixels, if no graphical frame shows it.")
 
@@ -104,6 +131,7 @@ Without it, pages that match the theme would not stand out from the desk.")
 (defvar-local typst-canvas--updated-point nil "Point at the last update of caret and equation.")
 (defvar-local typst-canvas--equation-overlay nil "Overlay that shows the equation at point.")
 (defvar-local typst-canvas--equation-canvas nil "Canvas image spec of the equation at point.")
+(defvar-local typst-canvas--presentation nil "Presentation buffer, or nil.")
 
 ;;;; State of the preview buffer
 
@@ -114,6 +142,17 @@ Without it, pages that match the theme would not stand out from the desk.")
 (defvar-local typst-canvas--zoom 1.0 "Zoom factor.  1 fits the page width to the window.")
 (defvar-local typst-canvas--width nil "Window width of the newest request, in pixels.")
 (defvar-local typst-canvas--caret-page nil "Page of the caret (0-based), or nil.")
+
+;;;; State of the presentation buffer
+
+(defvar-local typst-canvas--slide 0 "Page that the presentation shows (0-based).")
+(defvar-local typst-canvas--slide-canvas nil "Canvas image spec of the slide.")
+(defvar-local typst-canvas--slide-serial nil "Serial of the slide image in the canvas, or nil.")
+(defvar-local typst-canvas--slide-size nil "(WIDTH . HEIGHT) of the newest slide request.")
+(defvar-local typst-canvas--slide-digits "" "Digits typed for `typst-canvas-present-goto'.")
+(defvar-local typst-canvas--present-frame nil "Frame made for the presentation, or nil.")
+(defvar-local typst-canvas--present-windows nil
+  "Window configuration from before the presentation, or nil.")
 
 ;;;; Source buffer
 
@@ -174,6 +213,8 @@ Without it, pages that match the theme would not stand out from the desk.")
         typst-canvas--updated-point nil)
   (typst-canvas--hide-equation)
   (setq typst-canvas--equation-canvas nil)
+  (when (buffer-live-p typst-canvas--presentation)
+    (kill-buffer typst-canvas--presentation))
   ;; Stop the thread before deleting the process: in batch mode, Emacs does not ignore SIGPIPE,
   ;; so a write to a deleted pipe kills Emacs.
   (when typst-canvas--session
@@ -219,10 +260,14 @@ One send covers all the changes of a command, e.g. of `replace-regexp'."
 (defun typst-canvas--request (text)
   "Send TEXT and the preview view to the session of the current buffer.
 TEXT nil only re-renders the last good document, or compiles it again
-if the theme colors changed."
+if the theme colors changed.  While a presentation shows, ask for its
+slide too."
   (let ((width typst-canvas-default-width)
         (zoom 1.0)
-        (match-theme typst-canvas-match-theme))
+        (match-theme typst-canvas-match-theme)
+        (slide (when (buffer-live-p typst-canvas--presentation)
+                 (with-current-buffer typst-canvas--presentation
+                   (typst-canvas--slide-view)))))
     (when (buffer-live-p typst-canvas--preview)
       (with-current-buffer typst-canvas--preview
         (setq typst-canvas--width (typst-canvas--window-width))
@@ -233,7 +278,7 @@ if the theme colors changed."
     (pcase-let ((`(,desk ,page ,ink) (typst-canvas--colors match-theme)))
       (setq typst-canvas--sent
             (typst-canvas--session-request typst-canvas--session text width zoom
-                                           desk page ink)))
+                                           desk page ink slide)))
     (force-mode-line-update t)))
 
 (defun typst-canvas--colors (match-theme)
@@ -294,6 +339,8 @@ or the face colors are unknown."
                 (pages (nth 1 typst-canvas--status)))
             (with-current-buffer typst-canvas--preview
               (typst-canvas--show-pages session pages))))
+        (when (buffer-live-p typst-canvas--presentation)
+          (typst-canvas--show-slide))
         ;; The pages changed, so the caret and the equation can be elsewhere.
         (typst-canvas--update-caret)
         (typst-canvas--report-diagnostics)
@@ -780,6 +827,216 @@ See `typst-canvas--scroll-fraction'."
   "Show the previous page, or the COUNTth previous page."
   (interactive "p" typst-canvas-preview-mode)
   (typst-canvas--goto-page (- (typst-canvas--current-page) (or count 1))))
+
+;;;; Presentation
+
+(defvar-keymap typst-canvas-present-mode-map
+  :doc "Keymap for `typst-canvas-present-mode'."
+  "SPC" #'typst-canvas-present-next
+  "n" #'typst-canvas-present-next
+  "<right>" #'typst-canvas-present-next
+  "<down>" #'typst-canvas-present-next
+  "<next>" #'typst-canvas-present-next
+  "DEL" #'typst-canvas-present-previous
+  "p" #'typst-canvas-present-previous
+  "<left>" #'typst-canvas-present-previous
+  "<up>" #'typst-canvas-present-previous
+  "<prior>" #'typst-canvas-present-previous
+  "<home>" #'typst-canvas-present-first
+  "<end>" #'typst-canvas-present-last
+  "RET" #'typst-canvas-present-goto
+  "q" #'typst-canvas-present-quit)
+
+(dotimes (digit 10)
+  (keymap-set typst-canvas-present-mode-map (number-to-string digit)
+              #'typst-canvas-present-digit))
+
+(define-derived-mode typst-canvas-present-mode special-mode "Typst-Slides"
+  "Major mode that shows one page of a Typst buffer at a time, fit to the window.
+Slides update live while the source buffer changes.
+
+\\{typst-canvas-present-mode-map}"
+  (setq mode-line-format nil
+        header-line-format nil
+        cursor-type nil
+        truncate-lines t)
+  (face-remap-add-relative 'default :background "black")
+  (face-remap-add-relative 'fringe :background "black")
+  (setq typst-canvas--slide-canvas (list 'image :type 'canvas
+                                         :id (make-symbol "typst-canvas-slide")
+                                         :data-width 1 :data-height 1))
+  (let ((inhibit-read-only t))
+    (insert (propertize " " 'display typst-canvas--slide-canvas)))
+  (goto-char (point-min))
+  (add-hook 'window-size-change-functions #'typst-canvas--on-present-resize nil t)
+  (add-hook 'kill-buffer-hook #'typst-canvas--on-present-kill nil t))
+
+;;;###autoload
+(defun typst-canvas-present ()
+  "Show the pages of the current Typst buffer as slides, one at a time.
+Each page fits the whole window, on black, in a new fullscreen frame
+\(see `typst-canvas-present-frame').  It starts at the page that the
+preview shows.  Edits in the source buffer show live.  Keys:
+\\<typst-canvas-present-mode-map>
+\\[typst-canvas-present-next], n, <right>: next slide.
+\\[typst-canvas-present-previous], p, <left>: previous slide.
+Digits, then \\[typst-canvas-present-goto]: go to that slide.
+\\[typst-canvas-present-quit]: quit."
+  (interactive)
+  (let ((source (if (derived-mode-p 'typst-canvas-preview-mode) typst-canvas--source
+                  (current-buffer))))
+    (with-current-buffer source
+      (unless typst-canvas-mode
+        (typst-canvas-mode 1))
+      (when (buffer-live-p typst-canvas--presentation)
+        (kill-buffer typst-canvas--presentation))
+      (let ((page (typst-canvas--preview-page))
+            (buffer (get-buffer-create
+                     (format "*typst-canvas presentation: %s*" (buffer-name)))))
+        (with-current-buffer buffer
+          (typst-canvas-present-mode)
+          (setq typst-canvas--source source
+                typst-canvas--slide page))
+        (setq typst-canvas--presentation buffer)
+        ;; It selects BUFFER, but the request needs the session of SOURCE.
+        (save-current-buffer
+          (typst-canvas--show-presentation buffer))
+        (typst-canvas--request nil)
+        (message "Slide %d · SPC next · DEL previous · q quit" (1+ page))))))
+
+(defun typst-canvas--preview-page ()
+  "Return the page of the caret, else the top page of the preview window, else 0."
+  (or (and (buffer-live-p typst-canvas--preview)
+           (with-current-buffer typst-canvas--preview
+             (or typst-canvas--caret-page
+                 (when-let* ((window (get-buffer-window (current-buffer) t)))
+                   (/ (- (window-start window) (point-min)) 2)))))
+      0))
+
+(defun typst-canvas--show-presentation (buffer)
+  "Show the presentation BUFFER alone in a window: in a new frame, or the selected one."
+  (if typst-canvas-present-frame
+      (let ((frame (make-frame typst-canvas--present-frame-parameters)))
+        ;; Also the fringes of the minibuffer window.
+        (set-face-background 'fringe "black" frame)
+        (with-current-buffer buffer
+          (setq typst-canvas--present-frame frame))
+        (select-frame-set-input-focus frame))
+    (let ((windows (current-window-configuration)))
+      (with-current-buffer buffer
+        (setq typst-canvas--present-windows windows))))
+  (switch-to-buffer buffer)
+  (delete-other-windows)
+  (let ((window (selected-window)))
+    ;; See `typst-canvas--present-frame-parameters' for the fringes.
+    (set-window-fringes window 8 8)
+    (set-window-margins window 0 0)
+    (set-window-scroll-bars window 0 nil 0 nil)))
+
+(defun typst-canvas--slide-view ()
+  "Return [PAGE WIDTH HEIGHT] of the slide that the current presentation buffer shows."
+  (let* ((window (get-buffer-window (current-buffer) t))
+         (size (if (and window (display-graphic-p (window-frame window)))
+                   (cons (window-body-width window t) (window-body-height window t))
+                 (cons typst-canvas-default-width
+                       (round (* typst-canvas--present-aspect typst-canvas-default-width))))))
+    (setq typst-canvas--slide-size size)
+    (vector typst-canvas--slide (car size) (cdr size))))
+
+(defun typst-canvas--show-slide ()
+  "Copy the newest slide of the session of the current buffer into its presentation."
+  (let ((session typst-canvas--session)
+        (count (nth 1 typst-canvas--status)))
+    (with-current-buffer typst-canvas--presentation
+      ;; The document can lose pages.  The thread then shows the last one.
+      (when (and (> count 0) (>= typst-canvas--slide count))
+        (setq typst-canvas--slide (1- count)))
+      (pcase (typst-canvas--slide-info session)
+        ((and `(,serial ,width ,height) (guard (not (eql serial typst-canvas--slide-serial))))
+         (plist-put (cdr typst-canvas--slide-canvas) :data-width width)
+         (plist-put (cdr typst-canvas--slide-canvas) :data-height height)
+         (when (typst-canvas--present-slide session typst-canvas--slide-canvas)
+           (setq typst-canvas--slide-serial serial)))))))
+
+(defun typst-canvas--slide-count ()
+  "Return the number of pages of the source of the current presentation buffer."
+  (or (nth 1 (cadr (typst-canvas--source-status))) 0))
+
+(defun typst-canvas--present-show (page)
+  "Show slide PAGE (0-based), within the pages of the document."
+  (let ((count (typst-canvas--slide-count)))
+    (setq typst-canvas--slide (max 0 (min page (1- count)))
+          typst-canvas--slide-digits "")
+    (typst-canvas--request-view)
+    (message "Slide %d/%d" (1+ typst-canvas--slide) count)))
+
+(defun typst-canvas-present-next (&optional count)
+  "Show the next slide, or the COUNTth next one."
+  (interactive "p" typst-canvas-present-mode)
+  (typst-canvas--present-show (+ typst-canvas--slide (or count 1))))
+
+(defun typst-canvas-present-previous (&optional count)
+  "Show the previous slide, or the COUNTth previous one.
+If digits were typed for `typst-canvas-present-goto', delete the last one."
+  (interactive "p" typst-canvas-present-mode)
+  (if (string-empty-p typst-canvas--slide-digits)
+      (typst-canvas--present-show (- typst-canvas--slide (or count 1)))
+    (setq typst-canvas--slide-digits (substring typst-canvas--slide-digits 0 -1))
+    (message "Go to slide: %s" typst-canvas--slide-digits)))
+
+(defun typst-canvas-present-first ()
+  "Show the first slide."
+  (interactive nil typst-canvas-present-mode)
+  (typst-canvas--present-show 0))
+
+(defun typst-canvas-present-last ()
+  "Show the last slide."
+  (interactive nil typst-canvas-present-mode)
+  (typst-canvas--present-show (1- (typst-canvas--slide-count))))
+
+(defun typst-canvas-present-digit ()
+  "Add the typed digit to the slide number for `typst-canvas-present-goto'."
+  (interactive nil typst-canvas-present-mode)
+  (setq typst-canvas--slide-digits
+        (concat typst-canvas--slide-digits (string last-command-event)))
+  (message "Go to slide: %s" typst-canvas--slide-digits))
+
+(defun typst-canvas-present-goto ()
+  "Show the slide whose number (1-based) was typed as digits."
+  (interactive nil typst-canvas-present-mode)
+  (if (string-empty-p typst-canvas--slide-digits)
+      (message "Type a slide number, then RET")
+    (typst-canvas--present-show (1- (string-to-number typst-canvas--slide-digits)))))
+
+(defun typst-canvas-present-quit ()
+  "End the presentation."
+  (interactive nil typst-canvas-present-mode)
+  (kill-buffer (current-buffer)))
+
+(defun typst-canvas--on-present-resize (window)
+  "Ask for a new slide if the size of WINDOW changed."
+  (with-current-buffer (window-buffer window)
+    (when (and (display-graphic-p (window-frame window))
+               (not (equal (cons (window-body-width window t) (window-body-height window t))
+                           typst-canvas--slide-size)))
+      (typst-canvas--request-view))))
+
+(defun typst-canvas--on-present-kill ()
+  "Stop rendering slides, and close the presentation frame or restore the windows."
+  (let ((presentation (current-buffer))
+        (frame typst-canvas--present-frame)
+        (windows typst-canvas--present-windows))
+    (when (buffer-live-p typst-canvas--source)
+      (with-current-buffer typst-canvas--source
+        (when (eq typst-canvas--presentation presentation)
+          (setq typst-canvas--presentation nil)
+          (when typst-canvas--session
+            (typst-canvas--request nil)))))
+    (cond
+     ((and (frame-live-p frame) (cdr (frame-list)))
+      (delete-frame frame))
+     (windows
+      (set-window-configuration windows)))))
 
 ;;;; Demo
 

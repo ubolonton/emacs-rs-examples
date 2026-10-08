@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Open examples/sample.typ with `typst-canvas-mode' in a GUI frame under Xvfb, and save screenshots
-# to target/screenshot-{1..7}.png (see bin/screenshot.el). Needs xvfb-run and an Emacs 32 built
+# to target/screenshot-{1..9}.png (see bin/screenshot.el). Needs xvfb-run and an Emacs 32 built
 # with Cairo, e.g. EMACS=emacs-32-gtk bin/screenshot.sh. Also needs jq.
 
 set -euo pipefail

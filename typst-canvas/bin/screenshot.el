@@ -9,6 +9,8 @@
 ;; 5. Zoomed in, scrolled right.
 ;; 6. Point in an equation: it shows rendered below its source line.
 ;; 7. An error in that equation: the equation shows dimmed.
+;; 8. examples/slides.typ presented in a fullscreen frame: the first slide.
+;; 9. The fourth slide, after an edit in the source frame.
 
 (require 'cl-lib)
 (require 'typst-canvas)
@@ -25,17 +27,22 @@
 (defvar typst-canvas-screenshot--source nil)
 
 (defun typst-canvas-screenshot--settled-p ()
-  "Return non-nil if the newest request is served, and all pages are shown."
+  "Return non-nil if the newest request is served, and all pages are shown.
+Also the slide, while a presentation shows."
   (with-current-buffer typst-canvas-screenshot--source
     (and typst-canvas--status
          (>= (car typst-canvas--status) typst-canvas--sent)
          (with-current-buffer typst-canvas--preview
            (and (> (length typst-canvas--serials) 0)
-                (cl-every #'identity typst-canvas--serials))))))
+                (cl-every #'identity typst-canvas--serials)))
+         (or (not (buffer-live-p typst-canvas--presentation))
+             (eql (car (typst-canvas--slide-info typst-canvas--session))
+                  (buffer-local-value 'typst-canvas--slide-serial
+                                      typst-canvas--presentation))))))
 
-(defun typst-canvas-screenshot--save (name)
-  "Save a PNG of the frame as target/NAME."
-  (let ((png (x-export-frames nil 'png))
+(defun typst-canvas-screenshot--save (name &optional frame)
+  "Save a PNG of FRAME (default: the selected one) as target/NAME."
+  (let ((png (x-export-frames frame 'png))
         (file (expand-file-name (concat "target/" name) typst-canvas-screenshot--root)))
     (with-temp-file file
       (set-buffer-multibyte nil)
@@ -64,6 +71,12 @@
     (goto-char (point-min))
     (search-forward text)
     (typst-canvas--update-caret)))
+
+(defun typst-canvas-screenshot--presentation-frame ()
+  "Return the frame of the presentation of the source buffer."
+  (buffer-local-value 'typst-canvas--present-frame
+                      (buffer-local-value 'typst-canvas--presentation
+                                          typst-canvas-screenshot--source)))
 
 (defun typst-canvas-screenshot--caret-line-click ()
   "Return a click position on text in the caret's line, in the preview window."
@@ -148,6 +161,32 @@
     (lambda ()
       (with-current-buffer typst-canvas-screenshot--source
         (delete-region (- (point) (length " + #nope")) (point))
+        (set-buffer-modified-p nil))
+      (find-file (expand-file-name "examples/slides.typ" typst-canvas-screenshot--root))
+      (auto-save-mode -1)
+      (setq-local create-lockfiles nil)
+      (setq typst-canvas-screenshot--source (current-buffer))
+      (typst-canvas-mode 1))
+    (lambda ()
+      (with-current-buffer typst-canvas-screenshot--source
+        (goto-char (point-min))
+        (typst-canvas-present)))
+    (lambda ()
+      (typst-canvas-screenshot--save "screenshot-8.png"
+                                     (typst-canvas-screenshot--presentation-frame)))
+    (lambda ()
+      (with-current-buffer (buffer-local-value 'typst-canvas--presentation
+                                               typst-canvas-screenshot--source)
+        (typst-canvas-present-next 3))
+      ;; An edit in the source shows on the slide.
+      (with-current-buffer typst-canvas-screenshot--source
+        (goto-char (point-min))
+        (search-forward "e^(i pi) + 1 = 0")
+        (insert ", quad e^(i tau) = 1")))
+    (lambda ()
+      (typst-canvas-screenshot--save "screenshot-9.png"
+                                     (typst-canvas-screenshot--presentation-frame))
+      (with-current-buffer typst-canvas-screenshot--source
         (set-buffer-modified-p nil))))))
 
 ;;; screenshot.el ends here

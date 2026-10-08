@@ -51,6 +51,8 @@ const BAND_OPACITY: f64 = 0.1;
 /// The largest page image, in pixels. Bounds memory use at high zoom.
 pub const MAX_PAGE_PIXELS: f64 = 16_000_000.0;
 pub const MIN_PIXEL_PER_PT: f64 = 0.05;
+/// Color around a slide, as `0xAARRGGBB`.
+const SLIDE_BACKGROUND: u32 = BLACK;
 
 /// Serials are unique across sessions, so that Lisp can compare them without knowing where an
 /// image came from.
@@ -66,12 +68,24 @@ pub struct View {
     pub desk: u32,
 }
 
+/// How Lisp wants the slide of a presentation to look.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SlideView {
+    /// Page index, 0-based. Too large an index shows the last page.
+    pub page: usize,
+    /// Size of the presentation window body, in pixels. The page fits inside, centered.
+    pub width: u32,
+    pub height: u32,
+}
+
 /// Everything that affects the pixels of a page image.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 struct Key {
     page: u128,
     pixel_per_pt: u64,
     width: u32,
+    /// Image height of a slide. 0 for preview pages, whose height follows from the page.
+    height: u32,
     desk: u32,
 }
 
@@ -130,6 +144,7 @@ pub fn render_pages(
             page: hash128(page),
             pixel_per_pt: pixel_per_pt.to_bits(),
             width: view.width,
+            height: 0,
             desk: view.desk,
         })
         .collect();
@@ -266,6 +281,53 @@ fn render_page(page: &Page, pixel_per_pt: f64, view: View, key: Key) -> PageImag
         pixel_per_pt,
         key,
     }
+}
+
+/// Render the page of VIEW in DOCUMENT as a slide: as large as fits the view, centered, on black.
+/// Reuse PREVIOUS if it would not change. Return `None` if DOCUMENT has no pages.
+pub fn render_slide(
+    document: &PagedDocument,
+    view: SlideView,
+    previous: Option<&Arc<PageImage>>,
+) -> Option<Arc<PageImage>> {
+    let pages = document.pages();
+    let page = pages.get(view.page.min(pages.len().checked_sub(1)?))?;
+    let size = page.frame.size();
+    let fit = (f64::from(view.width.max(1)) / size.x.to_pt())
+        .min(f64::from(view.height.max(1)) / size.y.to_pt());
+    let pixel_per_pt = clamp_scale(fit, size.x.to_pt() * size.y.to_pt());
+    let key = Key {
+        page: hash128(page),
+        pixel_per_pt: pixel_per_pt.to_bits(),
+        width: view.width,
+        height: view.height,
+        desk: SLIDE_BACKGROUND,
+    };
+    if let Some(previous) = previous.filter(|image| image.key == key) {
+        return Some(Arc::clone(previous));
+    }
+    let pixmap = rasterize(page, pixel_per_pt);
+    let (page_width, page_height) = (pixmap.width() as usize, pixmap.height() as usize);
+    // Rounding can make the page a pixel larger than the view.
+    let width = (view.width as usize).max(page_width);
+    let height = (view.height as usize).max(page_height);
+    let rect = Rect {
+        x: (width - page_width) / 2,
+        y: (height - page_height) / 2,
+        width: page_width,
+        height: page_height,
+    };
+    let mut pixels = vec![SLIDE_BACKGROUND; width * height];
+    paint(&mut pixels, width, rect, &pixmap);
+    Some(Arc::new(PageImage {
+        serial: next_serial(),
+        width,
+        height,
+        pixels,
+        page: rect,
+        pixel_per_pt,
+        key,
+    }))
 }
 
 /// Return a new serial for an image. Serials are unique across sessions and image kinds.
@@ -475,6 +537,7 @@ mod tests {
                 page: 0,
                 pixel_per_pt: 0,
                 width: 0,
+                height: 0,
                 desk: 0,
             },
         }

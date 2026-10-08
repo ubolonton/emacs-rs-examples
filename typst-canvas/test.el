@@ -44,7 +44,7 @@ Fail after `typst-canvas-test--timeout' seconds."
   "Send TEXT to SESSION at WIDTH (default 300) pixels.  Wait until it is served.
 Return the status."
   (let ((id (typst-canvas--session-request session text (or width 300) 1.0
-                                           typst-canvas-test--desk nil nil)))
+                                           typst-canvas-test--desk nil nil nil)))
     (typst-canvas-test--wait (lambda () (>= (car (typst-canvas--session-status session)) id)))
     (typst-canvas--session-status session)))
 
@@ -132,7 +132,7 @@ Return the status."
   (typst-canvas-test--call-with-session
    (lambda (session notifications)
      (should (= (funcall notifications) 0))
-     (typst-canvas--session-request session typst-canvas-test--page 300 1.0 0 nil nil)
+     (typst-canvas--session-request session typst-canvas-test--page 300 1.0 0 nil nil nil)
      (typst-canvas-test--wait (lambda () (> (funcall notifications) 0))))))
 
 (ert-deftest typst-canvas::stop-ends-session ()
@@ -143,7 +143,7 @@ Return the status."
      (typst-canvas--session-stop session)
      (let ((served (car (typst-canvas--session-status session)))
            (count (funcall notifications)))
-       (typst-canvas--session-request session "B" 300 1.0 0 nil nil)
+       (typst-canvas--session-request session "B" 300 1.0 0 nil nil nil)
        (accept-process-output nil 0.5)
        (should (= (car (typst-canvas--session-status session)) served))
        (should (= (funcall notifications) count))
@@ -410,7 +410,7 @@ Return the status."
   (typst-canvas-test--call-with-session
    (lambda (session _)
      (let ((id (typst-canvas--session-request session typst-canvas-test--page 300 1.0
-                                              typst-canvas-test--desk #x000000 #xffffff)))
+                                              typst-canvas-test--desk #x000000 #xffffff nil)))
        (typst-canvas-test--wait (lambda () (>= (car (typst-canvas--session-status session)) id))))
      (let* ((canvas (typst-canvas-test--canvas-for session 0))
             (width (plist-get (cdr canvas) :data-width))
@@ -512,6 +512,86 @@ Return the status."
             (should (nth 4 (typst-canvas--session-equation typst-canvas--session (1- (point))
                                                            16.0 800)))))
       (typst-canvas-mode -1))))
+
+;;;; Presentation
+
+(defconst typst-canvas-test--slides
+  "#set page(width: 100pt, height: 100pt)\nA\n#pagebreak()\nB\n#pagebreak()\nC"
+  "Three square pages, which leave black bars in a wide presentation.")
+
+(defun typst-canvas-test--slide-shown-p (presentation)
+  "Return non-nil if PRESENTATION shows the slide of the newest request."
+  (with-current-buffer (buffer-local-value 'typst-canvas--source presentation)
+    (and typst-canvas--status
+         (>= (car typst-canvas--status) typst-canvas--sent)
+         (eql (car (typst-canvas--slide-info typst-canvas--session))
+              (buffer-local-value 'typst-canvas--slide-serial presentation)))))
+
+(ert-deftest typst-canvas::present-shows-one-page-at-a-time ()
+  (with-temp-buffer
+    (insert typst-canvas-test--slides)
+    (let ((source (current-buffer))
+          (shown (window-buffer (selected-window)))
+          (typst-canvas-present-frame nil))
+      (typst-canvas-mode 1)
+      (unwind-protect
+          (progn
+            (typst-canvas-test--settle)
+            (let ((start (typst-canvas--preview-page)))
+              (typst-canvas-present)
+              ;; It starts at the page that the preview shows.
+              (should (= (buffer-local-value 'typst-canvas--slide typst-canvas--presentation)
+                         start)))
+            (let* ((presentation (buffer-local-value 'typst-canvas--presentation source))
+                   (canvas (buffer-local-value 'typst-canvas--slide-canvas presentation))
+                   (serial nil))
+              (should (eq (window-buffer (selected-window)) presentation))
+              (with-current-buffer presentation
+                (typst-canvas-present-first)
+                (should-not mode-line-format)
+                (should-not header-line-format)
+                (typst-canvas-test--wait
+                 (lambda () (typst-canvas-test--slide-shown-p presentation)))
+                ;; The page fits the height, centered on black.
+                (should (= (image-property canvas :data-width) typst-canvas-default-width))
+                (should (= (typst-canvas--canvas-pixel canvas 0 100) #xff000000))
+                (should (= (typst-canvas--canvas-pixel canvas (/ typst-canvas-default-width 2) 10)
+                           #xffffffff))
+                ;; Next, previous, and a typed number.
+                (typst-canvas-present-next)
+                (should (= typst-canvas--slide 1))
+                (setq serial typst-canvas--slide-serial)
+                (typst-canvas-test--wait
+                 (lambda () (typst-canvas-test--slide-shown-p presentation)))
+                (should-not (eql typst-canvas--slide-serial serial))
+                (typst-canvas-present-previous)
+                (should (= typst-canvas--slide 0))
+                (let ((last-command-event ?3))
+                  (typst-canvas-present-digit))
+                (typst-canvas-present-goto)
+                (should (= typst-canvas--slide 2))
+                (typst-canvas-present-next)
+                (should (= typst-canvas--slide 2))
+                (typst-canvas-test--wait
+                 (lambda () (typst-canvas-test--slide-shown-p presentation)))
+                (setq serial typst-canvas--slide-serial))
+              ;; Edits in the source show live.
+              (goto-char (point-max))
+              (insert "D")
+              (typst-canvas-test--wait
+               (lambda () (and (typst-canvas-test--slide-shown-p presentation)
+                               (not (eql (buffer-local-value 'typst-canvas--slide-serial
+                                                             presentation)
+                                         serial)))))
+              ;; Quitting restores the windows, and stops the slides.
+              (with-current-buffer presentation
+                (typst-canvas-present-quit))
+              (should-not (buffer-live-p presentation))
+              (should (eq (window-buffer (selected-window)) shown))
+              (should-not typst-canvas--presentation)
+              (typst-canvas-test--settle)
+              (should-not (typst-canvas--slide-info typst-canvas--session))))
+        (typst-canvas-mode -1)))))
 
 ;;;; Demo
 
