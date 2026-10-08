@@ -8,7 +8,7 @@ use typst::{
     diag::FileResult,
     foundations::{Bytes, Datetime, Duration},
     introspection::PagedPosition,
-    layout::{Abs, Frame, FrameItem, Point},
+    layout::{Abs, Frame, FrameItem, Point, Transform},
     syntax::{FileId, LinkedNode, Side, Source, Span, SyntaxKind},
     text::{Font, FontBook},
     utils::LazyHash,
@@ -78,10 +78,15 @@ pub struct Caret {
 /// if the cursor is not in text that was laid out (e.g. it is in code or markup).
 ///
 /// `typst_ide::jump_from_cursor` finds the same text node, but returns the start of the node and
-/// no font size. This walks the frames the same way, but stops at the glyph of the cursor.
+/// no font size. This walks the frames the same way, but stops at the glyph of the cursor. Math
+/// identifiers count as text: `pi` shows as a glyph with the identifier's span.
 pub fn caret(document: &Document, cursor: usize) -> Option<Caret> {
-    let is_text =
-        |node: &LinkedNode| matches!(node.kind(), SyntaxKind::Text | SyntaxKind::MathText);
+    let is_text = |node: &LinkedNode| {
+        matches!(
+            node.kind(),
+            SyntaxKind::Text | SyntaxKind::MathText | SyntaxKind::MathIdent
+        )
+    };
     let root = LinkedNode::new(document.source.root());
     let node = root
         .leaf_at(cursor, Side::Before)
@@ -94,43 +99,70 @@ pub fn caret(document: &Document, cursor: usize) -> Option<Caret> {
         .iter()
         .enumerate()
         .find_map(|(page, content)| {
-            let (point, size) = find_glyph(&content.frame, node.span(), offset)?;
+            let mut search = GlyphSearch {
+                span: node.span(),
+                offset,
+                length: node.len(),
+                before: None,
+            };
+            let (point, size) = search
+                .walk(&content.frame, Transform::identity())
+                .or(search.before.map(|(_, point, size)| (point, size)))?;
             Some(Caret { page, point, size })
         })
 }
 
-/// Return the position and font size of the glyph at byte OFFSET in the text node SPAN, in FRAME.
-/// The position is the left edge of the glyph, or the right edge of the node's last glyph if
-/// OFFSET is at the end of the node.
-fn find_glyph(frame: &Frame, span: Span, offset: usize) -> Option<(Point, Abs)> {
-    let mut end = None;
-    for &(mut position, ref item) in frame.items() {
-        match item {
-            FrameItem::Group(group) => {
-                if let Some((point, size)) = find_glyph(&group.frame, span, offset) {
-                    return Some((position + point.transform(group.transform), size));
-                }
-            }
-            FrameItem::Text(text) => {
-                for glyph in &text.glyphs {
-                    let advance = glyph.x_advance.at(text.size);
-                    if glyph.span.0 == span {
-                        let start = usize::from(glyph.span.1);
-                        let glyph_end = start + glyph.range().len();
-                        if (start..glyph_end).contains(&offset) {
-                            return Some((position, text.size));
-                        }
-                        if glyph_end == offset {
-                            end = Some((position + Point::with_x(advance), text.size));
-                        }
+/// A search for the glyph at byte OFFSET in the text node SPAN, which is LENGTH bytes long.
+struct GlyphSearch {
+    span: Span,
+    offset: usize,
+    length: usize,
+    /// The node's glyph with the largest start before OFFSET: its start, the page position of its
+    /// right edge, and its font size. The caret goes there if no glyph contains OFFSET, e.g. at
+    /// the end of the node, or in spaces that collapsed into one.
+    before: Option<(usize, Point, Abs)>,
+}
+
+impl GlyphSearch {
+    /// Return the page position of the left edge of the glyph that contains the offset, and its
+    /// font size. TRANSFORM maps FRAME to the page.
+    fn walk(&mut self, frame: &Frame, transform: Transform) -> Option<(Point, Abs)> {
+        for &(position, ref item) in frame.items() {
+            match item {
+                FrameItem::Group(group) => {
+                    let inner = transform
+                        .pre_concat(Transform::translate(position.x, position.y))
+                        .pre_concat(group.transform);
+                    if let Some(found) = self.walk(&group.frame, inner) {
+                        return Some(found);
                     }
-                    position.x += advance;
                 }
+                FrameItem::Text(text) => {
+                    let mut x = position.x;
+                    for glyph in &text.glyphs {
+                        let advance = glyph.x_advance.at(text.size);
+                        if glyph.span.0 == self.span {
+                            let start = usize::from(glyph.span.1);
+                            // Math shapes letters as styled chars, e.g. "x" as "𝑥", and `pi` as
+                            // "π": their UTF-8 can be longer than the source.
+                            let end = (start + glyph.range().len()).min(self.length);
+                            let page = |x: Abs| Point::new(x, position.y).transform(transform);
+                            if (start..end).contains(&self.offset) {
+                                return Some((page(x), text.size));
+                            }
+                            let is_later = self.before.is_none_or(|(before, ..)| before <= start);
+                            if start < self.offset && is_later {
+                                self.before = Some((start, page(x + advance), text.size));
+                            }
+                        }
+                        x += advance;
+                    }
+                }
+                _ => {}
             }
-            _ => {}
         }
+        None
     }
-    end
 }
 
 /// The world, but with the main file text of a document, so that the document's spans resolve.
@@ -233,6 +265,26 @@ mod tests {
         assert_eq!(xs.len(), "Hello world".len());
         assert!(xs.windows(2).all(|pair| pair[0] < pair[1]), "{xs:?}");
         assert!(xs[0] > start.point.x);
+    }
+
+    #[test]
+    fn caret_moves_past_math_letters() {
+        let text = format!("{PAGE}$x^2 + alpha$");
+        let (_, document) = compile(&text);
+        let x = |needle: &str, shift: usize| {
+            caret_at(&document, &text, needle, shift).map(|caret| caret.point.x.to_pt())
+        };
+        // Math shapes "x" as "𝑥", whose UTF-8 is longer than the source.
+        let (Some(before), Some(after)) = (x("x^2", 0), x("x^2", 1)) else {
+            panic!("no caret at x");
+        };
+        assert!(after > before + 3.0, "{before} {after}");
+        // Identifiers too: before their glyph while in their name, and after it at its end.
+        let (Some(start), Some(middle), Some(end)) = (x("alpha", 0), x("alpha", 3), x("alpha", 5))
+        else {
+            panic!("no caret in alpha");
+        };
+        assert!(start <= middle && middle < end, "{start} {middle} {end}");
     }
 
     #[test]
