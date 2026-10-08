@@ -618,7 +618,16 @@ Do it after point stays still for `typst-canvas--follow-delay'."
 (defun typst-canvas--update-caret ()
   "Show point as the caret in the preview, and scroll to it if it is out of view.
 Hide the caret if `typst-canvas-follow-cursor' is nil.  Then update the
-equation at point, which shows the caret too."
+equation at point, which shows the caret too.
+
+Do nothing while the buffer has changes that are not sent: the session
+maps positions to the newest text sent, so point would be off.  The
+result of the send calls this again."
+  (unless typst-canvas--text-timer
+    (typst-canvas--update-caret-now)))
+
+(defun typst-canvas--update-caret-now ()
+  "Do the work of `typst-canvas--update-caret'."
   (let ((cursor (and typst-canvas-follow-cursor (point)))
         (session typst-canvas--session))
     (setq typst-canvas--caret-point cursor
@@ -659,7 +668,8 @@ equation at point, which shows the caret too."
 
 (defun typst-canvas--update-equation ()
   "Show the equation at point below its last source line, or hide it.
-Do nothing while a request is pending: its result calls this again."
+Do nothing while a request is pending: its result calls this again.
+Call it only when all buffer changes are sent: see `typst-canvas--update-caret'."
   (cond
    ((not typst-canvas-inline-math)
     (typst-canvas--hide-equation))

@@ -572,6 +572,29 @@ Return the status."
                                                            16.0 800)))))
       (typst-canvas-mode -1))))
 
+(ert-deftest typst-canvas::equation-waits-for-unsent-text ()
+  (with-temp-buffer
+    (insert typst-canvas-test--page "Hello world Text $x + y$ after this")
+    (typst-canvas-mode 1)
+    (unwind-protect
+        (progn
+          (typst-canvas-test--settle)
+          (goto-char (point-min))
+          (search-forward "Hello world ")
+          (delete-region (match-beginning 0) (match-end 0))
+          ;; Point is after the equation.  The text timer did not send the change yet, and in the
+          ;; sent text, the offset of point is in the equation.
+          (search-forward "after th")
+          (should typst-canvas--text-timer)
+          (typst-canvas--update-caret)
+          (should-not typst-canvas--equation-overlay)
+          (typst-canvas-test--settle)
+          (should-not typst-canvas--equation-overlay)
+          (search-backward "+ y")
+          (typst-canvas--update-caret)
+          (should typst-canvas--equation-overlay))
+      (typst-canvas-mode -1))))
+
 ;;;; Presentation
 
 (defconst typst-canvas-test--slides
