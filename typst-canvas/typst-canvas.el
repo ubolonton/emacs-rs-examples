@@ -115,6 +115,28 @@ left fringe keeps the slide centered.  Both are black.")
   "Percent by which the desk lightness differs from the `default' background.
 Without it, pages that match the theme would not stand out from the desk.")
 
+;;;; Errors in handlers
+
+(defvar typst-canvas--last-error nil
+  "The last error that `typst-canvas--with-guard' reported.")
+
+(defmacro typst-canvas--with-guard (&rest body)
+  "Run BODY.  Report an error in it in the echo area, once per distinct error.
+Use it in code that Emacs runs outside of commands: process filters,
+timers and hooks.  After an error in a process filter, Emacs pauses.
+After an error in some hooks, it removes the function from the hook.
+And a timer reports each of its errors."
+  (declare (indent 0) (debug t))
+  `(condition-case-unless-debug err
+       (progn ,@body)
+     (error (typst-canvas--report-error err))))
+
+(defun typst-canvas--report-error (err)
+  "Show ERR in the echo area, unless it was the last error shown."
+  (unless (equal err typst-canvas--last-error)
+    (setq typst-canvas--last-error err)
+    (message "typst-canvas: %s" (error-message-string err))))
+
 ;;;; State of the source buffer
 
 (defvar-local typst-canvas--session nil "Module session that compiles this buffer.")
@@ -171,6 +193,7 @@ Without it, pages that match the theme would not stand out from the desk.")
 
 (defun typst-canvas--start ()
   "Start a session for the current buffer, and show its preview."
+  (setq typst-canvas--last-error nil)
   (let* ((source (current-buffer))
          (main (or buffer-file-name (expand-file-name "untitled.typ")))
          (root (file-name-directory main))
@@ -184,11 +207,12 @@ Without it, pages that match the theme would not stand out from the desk.")
                              :noquery t
                              :coding 'binary
                              :filter (lambda (_process _output)
-                                       (typst-canvas--on-notify source))))
+                                       (typst-canvas--with-guard
+                                         (typst-canvas--on-notify source)))))
     (setq typst-canvas--session (typst-canvas--session-start root main typst-canvas--process))
     (add-hook 'after-change-functions #'typst-canvas--on-change nil t)
     (add-hook 'post-command-hook #'typst-canvas--on-post-command nil t)
-    (add-hook 'kill-buffer-hook #'typst-canvas--stop nil t)
+    (add-hook 'kill-buffer-hook #'typst-canvas--on-kill nil t)
     (add-hook 'flymake-diagnostic-functions #'typst-canvas-flymake nil t)
     (when (and typst-canvas-enable-flymake (not flymake-mode))
       (setq typst-canvas--started-flymake t)
@@ -201,7 +225,7 @@ Without it, pages that match the theme would not stand out from the desk.")
   "Stop the session of the current buffer, and kill its preview."
   (remove-hook 'after-change-functions #'typst-canvas--on-change t)
   (remove-hook 'post-command-hook #'typst-canvas--on-post-command t)
-  (remove-hook 'kill-buffer-hook #'typst-canvas--stop t)
+  (remove-hook 'kill-buffer-hook #'typst-canvas--on-kill t)
   (remove-hook 'flymake-diagnostic-functions #'typst-canvas-flymake t)
   (when typst-canvas--text-timer
     (cancel-timer typst-canvas--text-timer)
@@ -236,20 +260,27 @@ Without it, pages that match the theme would not stand out from the desk.")
     (when (buffer-live-p preview)
       (kill-buffer preview))))
 
+(defun typst-canvas--on-kill ()
+  "Stop the session of the killed buffer.  An error must not stop the kill."
+  (typst-canvas--with-guard
+    (typst-canvas--stop)))
+
 (defun typst-canvas--on-change (&rest _)
   "Send the buffer text after the current command or timer.
 One send covers all the changes of a command, e.g. of `replace-regexp'."
-  (unless typst-canvas--text-timer
-    (setq typst-canvas--text-timer
-          (run-with-timer 0 nil #'typst-canvas--send-text-of (current-buffer)))))
+  (typst-canvas--with-guard
+    (unless typst-canvas--text-timer
+      (setq typst-canvas--text-timer
+            (run-with-timer 0 nil #'typst-canvas--send-text-of (current-buffer))))))
 
 (defun typst-canvas--send-text-of (buffer)
   "Send the text of BUFFER, if it still has a session."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (setq typst-canvas--text-timer nil)
-      (when typst-canvas--session
-        (typst-canvas--send-text)))))
+  (typst-canvas--with-guard
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (setq typst-canvas--text-timer nil)
+        (when typst-canvas--session
+          (typst-canvas--send-text))))))
 
 (defun typst-canvas--send-text ()
   "Send the whole text of the current buffer to its session."
@@ -323,10 +354,11 @@ or the face colors are unknown."
 
 (defun typst-canvas--on-theme-change (&rest _)
   "Send the new theme colors of all sessions."
-  (dolist (buffer (buffer-list))
-    (with-current-buffer buffer
-      (when typst-canvas--session
-        (typst-canvas--request nil)))))
+  (typst-canvas--with-guard
+    (dolist (buffer (buffer-list))
+      (with-current-buffer buffer
+        (when typst-canvas--session
+          (typst-canvas--request nil))))))
 
 (defun typst-canvas--on-notify (source)
   "Show the newest result of the session of SOURCE."
@@ -361,18 +393,28 @@ they arrive."
 
 (defun typst-canvas--report-diagnostics (&optional always)
   "Send the newest diagnostics to Flymake, if they changed or ALWAYS is non-nil."
+  (unless flymake-mode
+    ;; Flymake would still take the report, and show it.  When Flymake starts again, it calls the
+    ;; backend with a new report function.
+    (setq typst-canvas--report-fn nil))
   (when (and typst-canvas--report-fn typst-canvas--session)
     (let ((diagnostics (typst-canvas--session-diagnostics typst-canvas--session)))
       (when (or always (not (equal diagnostics typst-canvas--reported)))
         (setq typst-canvas--reported diagnostics)
-        ;; Flymake adds the diagnostics of later reports in one check to those of the first.  The
-        ;; whole buffer as the region makes each report replace them.  A new check, which would
-        ;; also replace them, starts only after idle time: maybe much later.
-        (funcall typst-canvas--report-fn
-                 (mapcar #'typst-canvas--make-diagnostic diagnostics)
-                 :region (save-restriction
-                           (widen)
-                           (cons (point-min) (point-max))))))))
+        (condition-case err
+            ;; Flymake adds the diagnostics of later reports in one check to those of the first.
+            ;; The whole buffer as the region makes each report replace them.  A new check, which
+            ;; would also replace them, starts only after idle time: maybe much later.
+            (funcall typst-canvas--report-fn
+                     (mapcar #'typst-canvas--make-diagnostic diagnostics)
+                     :region (save-restriction
+                               (widen)
+                               (cons (point-min) (point-max))))
+          (error
+           ;; E.g. Flymake disabled the backend.  Do not call the function again: Flymake's next
+           ;; check gives a new one.
+           (setq typst-canvas--report-fn nil)
+           (signal (car err) (cdr err))))))))
 
 (defun typst-canvas--make-diagnostic (diagnostic)
   "Make a Flymake diagnostic from DIAGNOSTIC.
@@ -527,10 +569,11 @@ Each page is one canvas image on its own line."
 
 (defun typst-canvas--on-resize (window)
   "Re-render if the width of WINDOW changed."
-  (with-current-buffer (window-buffer window)
-    (when (and (display-graphic-p (window-frame window))
-               (not (eql (window-body-width window t) typst-canvas--width)))
-      (typst-canvas--request-view))))
+  (typst-canvas--with-guard
+    (with-current-buffer (window-buffer window)
+      (when (and (display-graphic-p (window-frame window))
+                 (not (eql (window-body-width window t) typst-canvas--width)))
+        (typst-canvas--request-view)))))
 
 (defun typst-canvas--revert (&rest _)
   "Compile the source buffer again."
@@ -541,12 +584,13 @@ Each page is one canvas image on its own line."
 
 (defun typst-canvas--on-preview-kill ()
   "Turn off `typst-canvas-mode' in the source buffer."
-  (let ((preview (current-buffer)))
-    (when (buffer-live-p typst-canvas--source)
-      (with-current-buffer typst-canvas--source
-        (when (and typst-canvas-mode (eq typst-canvas--preview preview))
-          (setq typst-canvas--preview nil)
-          (typst-canvas-mode -1))))))
+  (typst-canvas--with-guard
+    (let ((preview (current-buffer)))
+      (when (buffer-live-p typst-canvas--source)
+        (with-current-buffer typst-canvas--source
+          (when (and typst-canvas-mode (eq typst-canvas--preview preview))
+            (setq typst-canvas--preview nil)
+            (typst-canvas-mode -1)))))))
 
 (defun typst-canvas--set-zoom (zoom)
   "Set the zoom of the preview to ZOOM, within `typst-canvas-zoom-range'."
@@ -599,21 +643,23 @@ See `typst-canvas-match-theme'."
 (defun typst-canvas--on-post-command ()
   "Move the caret, and update the equation at point.
 Do it after point stays still for `typst-canvas--follow-delay'."
-  (unless (and (eql (point) typst-canvas--updated-point)
-               (eql (and typst-canvas-follow-cursor (point)) typst-canvas--caret-point))
-    (when typst-canvas--caret-timer
-      (cancel-timer typst-canvas--caret-timer))
-    (setq typst-canvas--caret-timer
-          (run-with-timer typst-canvas--follow-delay nil
-                          #'typst-canvas--update-caret-of (current-buffer)))))
+  (typst-canvas--with-guard
+    (unless (and (eql (point) typst-canvas--updated-point)
+                 (eql (and typst-canvas-follow-cursor (point)) typst-canvas--caret-point))
+      (when typst-canvas--caret-timer
+        (cancel-timer typst-canvas--caret-timer))
+      (setq typst-canvas--caret-timer
+            (run-with-timer typst-canvas--follow-delay nil
+                            #'typst-canvas--update-caret-of (current-buffer))))))
 
 (defun typst-canvas--update-caret-of (buffer)
   "Move the caret of BUFFER, if it still has a session."
-  (when (buffer-live-p buffer)
-    (with-current-buffer buffer
-      (setq typst-canvas--caret-timer nil)
-      (when typst-canvas--session
-        (typst-canvas--update-caret)))))
+  (typst-canvas--with-guard
+    (when (buffer-live-p buffer)
+      (with-current-buffer buffer
+        (setq typst-canvas--caret-timer nil)
+        (when typst-canvas--session
+          (typst-canvas--update-caret))))))
 
 (defun typst-canvas--update-caret ()
   "Show point as the caret in the preview, and scroll to it if it is out of view.
@@ -1027,28 +1073,30 @@ If digits were typed for `typst-canvas-present-goto', delete the last one."
 
 (defun typst-canvas--on-present-resize (window)
   "Ask for a new slide if the size of WINDOW changed."
-  (with-current-buffer (window-buffer window)
-    (when (and (display-graphic-p (window-frame window))
-               (not (equal (cons (window-body-width window t) (window-body-height window t))
-                           typst-canvas--slide-size)))
-      (typst-canvas--request-view))))
+  (typst-canvas--with-guard
+    (with-current-buffer (window-buffer window)
+      (when (and (display-graphic-p (window-frame window))
+                 (not (equal (cons (window-body-width window t) (window-body-height window t))
+                             typst-canvas--slide-size)))
+        (typst-canvas--request-view)))))
 
 (defun typst-canvas--on-present-kill ()
   "Stop rendering slides, and close the presentation frame or restore the windows."
-  (let ((presentation (current-buffer))
-        (frame typst-canvas--present-frame)
-        (windows typst-canvas--present-windows))
-    (when (buffer-live-p typst-canvas--source)
-      (with-current-buffer typst-canvas--source
-        (when (eq typst-canvas--presentation presentation)
-          (setq typst-canvas--presentation nil)
-          (when typst-canvas--session
-            (typst-canvas--request nil)))))
-    (cond
-     ((and (frame-live-p frame) (cdr (frame-list)))
-      (delete-frame frame))
-     (windows
-      (set-window-configuration windows)))))
+  (typst-canvas--with-guard
+    (let ((presentation (current-buffer))
+          (frame typst-canvas--present-frame)
+          (windows typst-canvas--present-windows))
+      (when (buffer-live-p typst-canvas--source)
+        (with-current-buffer typst-canvas--source
+          (when (eq typst-canvas--presentation presentation)
+            (setq typst-canvas--presentation nil)
+            (when typst-canvas--session
+              (typst-canvas--request nil)))))
+      (cond
+       ((and (frame-live-p frame) (cdr (frame-list)))
+        (delete-frame frame))
+       (windows
+        (set-window-configuration windows))))))
 
 ;;;; Demo
 

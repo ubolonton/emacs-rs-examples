@@ -235,6 +235,49 @@ Return the status."
             (typst-canvas-test--wait (lambda () (null (flymake-diagnostics)))))
         (typst-canvas-mode -1)))))
 
+(ert-deftest typst-canvas::flymake-off-stops-reports ()
+  (with-temp-buffer
+    (insert typst-canvas-test--page "A")
+    (let ((flymake-no-changes-timeout nil))
+      (typst-canvas-mode 1)
+      (unwind-protect
+          (progn
+            (flymake-start)
+            (typst-canvas-test--settle)
+            (should typst-canvas--report-fn)
+            (flymake-mode -1)
+            ;; New diagnostics do not go to the report function of the stopped Flymake.
+            (insert "\n#nope")
+            (typst-canvas-test--wait (lambda () (and (null typst-canvas--text-timer)
+                                                     typst-canvas--status
+                                                     (> (nth 2 typst-canvas--status) 0))))
+            (should-not (flymake-diagnostics))
+            (should-not (overlays-in (point-min) (point-max))))
+        (typst-canvas-mode -1)))))
+
+(ert-deftest typst-canvas::handler-errors-are-reported-once ()
+  (with-temp-buffer
+    (insert typst-canvas-test--page "A")
+    (typst-canvas-mode 1)
+    (unwind-protect
+        (let ((filter (process-filter typst-canvas--process))
+              (process typst-canvas--process)
+              (debug-on-error nil)
+              (messages nil))
+          (typst-canvas-test--settle)
+          (cl-letf (((symbol-function 'typst-canvas--report-diagnostics)
+                     (lambda (&rest _) (error "Boom")))
+                    ((symbol-function 'message)
+                     (lambda (format &rest arguments)
+                       (push (apply #'format-message format arguments) messages))))
+            ;; Emacs pauses after an error in a process filter, so the filter must not signal.
+            (funcall filter process "\n")
+            (funcall filter process "\n")
+            ;; Timers report errors themselves, but each time.
+            (typst-canvas--update-caret-of (current-buffer)))
+          (should (equal messages '("typst-canvas: Boom"))))
+      (typst-canvas-mode -1))))
+
 (ert-deftest typst-canvas::killing-preview-turns-off-mode ()
   (with-temp-buffer
     (insert typst-canvas-test--page)
