@@ -295,8 +295,14 @@ they arrive."
     (let ((diagnostics (typst-canvas--session-diagnostics typst-canvas--session)))
       (when (or always (not (equal diagnostics typst-canvas--reported)))
         (setq typst-canvas--reported diagnostics)
+        ;; Flymake adds the diagnostics of later reports in one check to those of the first.  The
+        ;; whole buffer as the region makes each report replace them.  A new check, which would
+        ;; also replace them, starts only after idle time: maybe much later.
         (funcall typst-canvas--report-fn
-                 (mapcar #'typst-canvas--make-diagnostic diagnostics))))))
+                 (mapcar #'typst-canvas--make-diagnostic diagnostics)
+                 :region (save-restriction
+                           (widen)
+                           (cons (point-min) (point-max))))))))
 
 (defun typst-canvas--make-diagnostic (diagnostic)
   "Make a Flymake diagnostic from DIAGNOSTIC.

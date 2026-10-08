@@ -215,6 +215,25 @@ Return the status."
       (kill-buffer buffer)
       (delete-file file))))
 
+(ert-deftest typst-canvas::fix-clears-flymake-diagnostics ()
+  (with-temp-buffer
+    (insert typst-canvas-test--page "A")
+    ;; No new Flymake check: the session reports the fix through the same report function.
+    (let ((flymake-no-changes-timeout nil))
+      (typst-canvas-mode 1)
+      (unwind-protect
+          (progn
+            (flymake-start)
+            (typst-canvas-test--wait
+             (lambda () (and typst-canvas--status (>= (car typst-canvas--status) typst-canvas--sent))))
+            (insert "\n#nope")
+            (typst-canvas-test--wait #'flymake-diagnostics)
+            ;; Fix the error, but keep its text: deleting it would delete its overlay.
+            (goto-char (point-min))
+            (insert "#let nope = 1\n")
+            (typst-canvas-test--wait (lambda () (null (flymake-diagnostics)))))
+        (typst-canvas-mode -1)))))
+
 (ert-deftest typst-canvas::killing-preview-turns-off-mode ()
   (with-temp-buffer
     (insert typst-canvas-test--page)

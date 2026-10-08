@@ -62,6 +62,8 @@ thread touches only Rust-owned buffers. Canvas size mismatch → skip copy, neve
   - `window-size-change-functions` re-renders when the window body width changes.
 - Each page is one line: an image char with a `typst-canvas-page` text property (0-based index), and a newline. Page lines are added or removed at the end.
 - Canvas specs get an uninterned `:id`: Emacs finds canvases by `eq` spec, but its image cache matches specs by `equal`. Resize: `plist-put` of `:data-width`/`:data-height` on the same spec.
+- Flymake reports pass the whole buffer as `:region`, so each report replaces the last one. Without it, reports after the first in one Flymake check only add diagnostics, and a fixed error stays marked until the next check (after idle time).
+
 
 ## Testing
 
