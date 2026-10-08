@@ -278,6 +278,34 @@ Return the status."
           (should (equal messages '("typst-canvas: Boom"))))
       (typst-canvas-mode -1))))
 
+(ert-deftest typst-canvas::raw-bytes-show-as-replacement-chars ()
+  (dolist (multibyte '(t nil))
+    (with-temp-buffer
+      (set-buffer-multibyte multibyte)
+      ;; One raw byte: invalid UTF-8.  A unibyte buffer has bytes, not chars.
+      (insert typst-canvas-test--page "A "
+              (if multibyte (string-to-multibyte "\377") "\377")
+              " #nope")
+      (let ((messages nil))
+        (cl-letf (((symbol-function 'message)
+                   (lambda (format &rest arguments)
+                     (push (apply #'format-message format arguments) messages))))
+          (typst-canvas-mode 1)
+          (unwind-protect
+              (progn
+                (typst-canvas-test--settle)
+                (should (= (nth 2 typst-canvas--status) 1))
+                ;; Each raw byte is one char, in Emacs and in the text sent, so positions agree.
+                (pcase-let ((`((,beg ,end . ,_))
+                             (typst-canvas--session-diagnostics typst-canvas--session)))
+                  (should (equal (buffer-substring beg end) "nope")))
+                (insert " ")
+                (typst-canvas-test--settle)
+                (should (= (cl-count-if (lambda (message) (string-search "raw bytes" message))
+                                        messages)
+                           1)))
+            (typst-canvas-mode -1)))))))
+
 (ert-deftest typst-canvas::killing-preview-turns-off-mode ()
   (with-temp-buffer
     (insert typst-canvas-test--page)

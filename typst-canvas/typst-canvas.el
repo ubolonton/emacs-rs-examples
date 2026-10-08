@@ -154,6 +154,8 @@ And a timer reports each of its errors."
 (defvar-local typst-canvas--equation-overlay nil "Overlay that shows the equation at point.")
 (defvar-local typst-canvas--equation-canvas nil "Canvas image spec of the equation at point.")
 (defvar-local typst-canvas--presentation nil "Presentation buffer, or nil.")
+(defvar-local typst-canvas--warned-raw-bytes nil
+  "Non-nil if the user was told that this buffer has raw bytes.")
 
 ;;;; State of the preview buffer
 
@@ -284,9 +286,28 @@ One send covers all the changes of a command, e.g. of `replace-regexp'."
 
 (defun typst-canvas--send-text ()
   "Send the whole text of the current buffer to its session."
-  (typst-canvas--request (save-restriction
-                           (widen)
-                           (buffer-substring-no-properties (point-min) (point-max)))))
+  (typst-canvas--request (typst-canvas--unicode-text
+                          (save-restriction
+                            (widen)
+                            (buffer-substring-no-properties (point-min) (point-max))))))
+
+(defconst typst-canvas--raw-byte-regexp "[\x3fff80-\x3fffff]"
+  "Regexp that matches a raw byte: a char that is not Unicode, e.g. from invalid UTF-8.")
+
+(defun typst-canvas--unicode-text (text)
+  "Return TEXT with each raw byte as U+FFFD.  The module takes only Unicode text.
+Raw bytes come from invalid UTF-8, and from unibyte buffers.  Each U+FFFD
+is one char, like the raw byte, so positions stay the same.  Tell the
+user once per buffer."
+  ;; A unibyte string has bytes.  As multibyte, those over 127 are raw bytes.
+  (let ((text (string-to-multibyte text)))
+    (if (not (string-match-p typst-canvas--raw-byte-regexp text))
+        text
+      (unless typst-canvas--warned-raw-bytes
+        (setq typst-canvas--warned-raw-bytes t)
+        (message "typst-canvas: %s has raw bytes, which the preview shows as U+FFFD"
+                 (buffer-name)))
+      (replace-regexp-in-string typst-canvas--raw-byte-regexp "\ufffd" text t t))))
 
 (defun typst-canvas--request (text)
   "Send TEXT and the preview view to the session of the current buffer.
