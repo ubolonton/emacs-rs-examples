@@ -303,9 +303,12 @@ impl Drop for Session {
 
 impl Shared {
     fn run(&self, mut world: PreviewWorld) {
+        // True while the world has a change (text or theme) that no published output reflects, e.g.
+        // after a panic. The next request compiles then, also without a change of its own.
+        let mut dirty = false;
         while let Some((id, request)) = self.take_request() {
             let served = panic::catch_unwind(AssertUnwindSafe(|| {
-                self.serve(&mut world, id, request);
+                self.serve(&mut world, &mut dirty, id, request);
             }));
             if served.is_err() {
                 let mut output = lock(&self.output);
@@ -341,13 +344,14 @@ impl Shared {
         }
     }
 
-    fn serve(&self, world: &mut PreviewWorld, id: u64, request: Request) {
+    fn serve(&self, world: &mut PreviewWorld, dirty: &mut bool, id: u64, request: Request) {
         let start = Instant::now();
-        let theme_changed = world.set_theme(request.theme);
+        *dirty |= world.set_theme(request.theme);
         if let Some(text) = &request.text {
             world.set_main_text(text);
+            *dirty = true;
         }
-        let compiled = (theme_changed || request.text.is_some()).then(|| world.compile());
+        let compiled = dirty.then(|| world.compile());
         #[cfg(test)]
         if let Some(after_compile) = lock(&self.after_compile).as_mut() {
             after_compile();
@@ -392,6 +396,7 @@ impl Shared {
             compile_ms,
             render_ms,
         });
+        *dirty = false;
     }
 }
 
@@ -689,10 +694,50 @@ mod tests {
         assert_eq!(session.shown().pages.len(), 1);
         let cursor = find(&text, "B")?;
         let (_, place) = session.set_caret(Some(cursor), 0);
-        assert!(place.as_ref().is_none_or(|place| place.page == 0), "{place:?}");
+        assert!(
+            place.as_ref().is_none_or(|place| place.page == 0),
+            "{place:?}"
+        );
         assert_eq!(session.take_output().pages.len(), 2);
         let (_, place) = session.set_caret(Some(cursor), 0);
         assert_eq!(place.map(|place| place.page), Some(1));
+        Ok(())
+    }
+
+    #[test]
+    fn compiles_again_after_panic() -> TestResult {
+        let (session, notifications) = start()?;
+        let serve = |text: Option<&str>, theme| {
+            let id = session.request(Request {
+                text: text.map(Into::into),
+                theme,
+                view: view(200),
+                slide: None,
+            });
+            wait_for(&session, &notifications, id);
+            session.take_output()
+        };
+        serve(Some("#set page(width: 100pt, height: 50pt)"), None);
+        // The next compile panics, after the world took the theme.
+        let mut armed = true;
+        *lock(&session.shared.after_compile) = Some(Box::new(move || {
+            if mem::take(&mut armed) {
+                panic::resume_unwind(Box::new("injected"));
+            }
+        }));
+        let theme = Some(Theme {
+            page: 0x00_0000,
+            text: 0xFF_FFFF,
+        });
+        assert_eq!(serve(None, theme).count(Severity::Error), 1);
+        // The same theme again does not change the world, but no output has it yet.
+        let output = serve(None, theme);
+        assert_eq!(*output.diagnostics, []);
+        let image = &output.pages[0];
+        assert_eq!(
+            image.pixels[image.height / 2 * image.width + image.width / 2],
+            0xFF00_0000
+        );
         Ok(())
     }
 
