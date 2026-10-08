@@ -354,6 +354,56 @@ Return the status."
            (remove-hook 'post-gc-hook hook))
          (should (> calls 0)))))))
 
+(ert-deftest typst-canvas::major-mode-change-stops-session ()
+  (with-temp-buffer
+    (insert typst-canvas-test--page "A")
+    (typst-canvas-mode 1)
+    (let ((preview typst-canvas--preview)
+          (process typst-canvas--process))
+      (typst-canvas-test--settle)
+      (text-mode)
+      (should-not typst-canvas-mode)
+      (should-not typst-canvas--session)
+      (should-not (buffer-live-p preview))
+      (should-not (process-live-p process))
+      ;; The mode works in the new major mode.
+      (typst-canvas-mode 1)
+      (typst-canvas-test--settle)
+      (should (= (nth 1 typst-canvas--status) 1))
+      (typst-canvas-mode -1))))
+
+(ert-deftest typst-canvas::clones-leave-session-to-original ()
+  (dolist (indirect '(nil t))
+    (with-temp-buffer
+      (insert typst-canvas-test--page "A")
+      (typst-canvas-mode 1)
+      (unwind-protect
+          (let ((session typst-canvas--session)
+                (preview typst-canvas--preview)
+                (clone (if indirect (clone-indirect-buffer nil nil) (clone-buffer))))
+            (typst-canvas-test--settle)
+            (with-current-buffer clone
+              (should-not typst-canvas-mode)
+              (should-not typst-canvas--session)
+              (should-not typst-canvas--preview)
+              (should-not (memq 'typst-canvas-mode local-minor-modes))
+              (goto-char (point-max))
+              (insert "\n#pagebreak()\nB"))
+            ;; An indirect clone shares the text: its changes show in the preview of the original.
+            (when indirect
+              (typst-canvas-test--wait
+               (lambda () (= (length (buffer-local-value 'typst-canvas--canvases preview)) 2))))
+            (kill-buffer clone)
+            (should (memq 'typst-canvas-mode local-minor-modes))
+            (should (eq typst-canvas--session session))
+            (should (buffer-live-p preview))
+            (should (process-live-p typst-canvas--process))
+            (insert "\n#pagebreak()\nC")
+            (typst-canvas-test--wait
+             (lambda () (= (length (buffer-local-value 'typst-canvas--canvases preview))
+                           (if indirect 3 2)))))
+        (typst-canvas-mode -1)))))
+
 ;;;; Backward sync
 
 (defconst typst-canvas-test--jump-page

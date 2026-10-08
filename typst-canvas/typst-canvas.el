@@ -157,6 +157,16 @@ And a timer reports each of its errors."
 (defvar-local typst-canvas--warned-raw-bytes nil
   "Non-nil if the user was told that this buffer has raw bytes.")
 
+(defconst typst-canvas--source-variables
+  '(typst-canvas--session typst-canvas--process typst-canvas--preview typst-canvas--text-timer
+    typst-canvas--sent typst-canvas--status typst-canvas--report-fn typst-canvas--reported
+    typst-canvas--started-flymake typst-canvas--caret-timer typst-canvas--caret-point
+    typst-canvas--updated-point typst-canvas--equation-overlay typst-canvas--equation-canvas
+    typst-canvas--presentation typst-canvas--warned-raw-bytes)
+  "The state of a source buffer, above.
+A clone of the buffer gets copies, and must forget them: the session,
+process, preview, timers and overlay belong to the original.")
+
 ;;;; State of the preview buffer
 
 (defvar-local typst-canvas--source nil "Source buffer of this preview.")
@@ -216,6 +226,10 @@ And a timer reports each of its errors."
     (add-hook 'post-command-hook #'typst-canvas--on-post-command nil t)
     (add-hook 'kill-buffer-hook #'typst-canvas--on-kill nil t)
     (add-hook 'flymake-diagnostic-functions #'typst-canvas-flymake nil t)
+    ;; A new major mode kills the local state, but not the session, process, preview and timers.
+    (add-hook 'change-major-mode-hook #'typst-canvas--on-change-major-mode nil t)
+    (add-hook 'clone-buffer-hook #'typst-canvas--on-clone nil t)
+    (add-hook 'clone-indirect-buffer-hook #'typst-canvas--on-clone nil t)
     (when (and typst-canvas-enable-flymake (not flymake-mode))
       (setq typst-canvas--started-flymake t)
       (flymake-mode 1))
@@ -225,10 +239,7 @@ And a timer reports each of its errors."
 
 (defun typst-canvas--stop ()
   "Stop the session of the current buffer, and kill its preview."
-  (remove-hook 'after-change-functions #'typst-canvas--on-change t)
-  (remove-hook 'post-command-hook #'typst-canvas--on-post-command t)
-  (remove-hook 'kill-buffer-hook #'typst-canvas--on-kill t)
-  (remove-hook 'flymake-diagnostic-functions #'typst-canvas-flymake t)
+  (typst-canvas--remove-hooks)
   (when typst-canvas--text-timer
     (cancel-timer typst-canvas--text-timer)
     (setq typst-canvas--text-timer nil))
@@ -262,6 +273,34 @@ And a timer reports each of its errors."
     (when (buffer-live-p preview)
       (kill-buffer preview))))
 
+(defun typst-canvas--remove-hooks ()
+  "Remove the local hooks of `typst-canvas-mode' from the current buffer."
+  (remove-hook 'after-change-functions #'typst-canvas--on-change t)
+  (remove-hook 'post-command-hook #'typst-canvas--on-post-command t)
+  (remove-hook 'kill-buffer-hook #'typst-canvas--on-kill t)
+  (remove-hook 'flymake-diagnostic-functions #'typst-canvas-flymake t)
+  (remove-hook 'change-major-mode-hook #'typst-canvas--on-change-major-mode t)
+  (remove-hook 'clone-buffer-hook #'typst-canvas--on-clone t)
+  (remove-hook 'clone-indirect-buffer-hook #'typst-canvas--on-clone t))
+
+(defun typst-canvas--on-change-major-mode ()
+  "Turn off `typst-canvas-mode' before a new major mode kills its state."
+  (typst-canvas--with-guard
+    (typst-canvas-mode -1)))
+
+(defun typst-canvas--on-clone ()
+  "Forget the state that a clone copied from its source buffer.
+The original keeps its session.  An indirect clone shares the text with
+the original, so its changes go to the session of the original."
+  (typst-canvas--with-guard
+    (typst-canvas--remove-hooks)
+    (mapc #'kill-local-variable typst-canvas--source-variables)
+    (kill-local-variable 'typst-canvas-mode)
+    ;; Not `delq': the clone can share the list with the original.
+    (setq local-minor-modes (remq 'typst-canvas-mode local-minor-modes))
+    (when (buffer-base-buffer)
+      (add-hook 'after-change-functions #'typst-canvas--on-change nil t))))
+
 (defun typst-canvas--on-kill ()
   "Stop the session of the killed buffer.  An error must not stop the kill."
   (typst-canvas--with-guard
@@ -269,11 +308,16 @@ And a timer reports each of its errors."
 
 (defun typst-canvas--on-change (&rest _)
   "Send the buffer text after the current command or timer.
-One send covers all the changes of a command, e.g. of `replace-regexp'."
+One send covers all the changes of a command, e.g. of `replace-regexp'.
+In an indirect buffer without a session, send the text of the base
+buffer, which changed too."
   (typst-canvas--with-guard
-    (unless typst-canvas--text-timer
-      (setq typst-canvas--text-timer
-            (run-with-timer 0 nil #'typst-canvas--send-text-of (current-buffer))))))
+    (let ((buffer (or (and (not typst-canvas--session) (buffer-base-buffer))
+                      (current-buffer))))
+      (with-current-buffer buffer
+        (when (and typst-canvas--session (not typst-canvas--text-timer))
+          (setq typst-canvas--text-timer
+                (run-with-timer 0 nil #'typst-canvas--send-text-of buffer)))))))
 
 (defun typst-canvas--send-text-of (buffer)
   "Send the text of BUFFER, if it still has a session."
