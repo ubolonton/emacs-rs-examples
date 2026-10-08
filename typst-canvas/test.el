@@ -796,6 +796,45 @@ Return the status."
               (should-not (typst-canvas--slide-info typst-canvas--session))))
         (typst-canvas-mode -1)))))
 
+(ert-deftest typst-canvas::hidden-presentation-stops-slides ()
+  (with-temp-buffer
+    (insert typst-canvas-test--slides)
+    (let ((source (current-buffer))
+          (typst-canvas-present-frame nil))
+      (typst-canvas-mode 1)
+      (save-window-excursion
+        (unwind-protect
+            (let (presentation)
+              (typst-canvas-test--settle)
+              (typst-canvas-present)
+              (setq presentation typst-canvas--presentation)
+              (typst-canvas-test--settle)
+              (should (typst-canvas--slide-info typst-canvas--session))
+              ;; Its window shows another buffer: no more slides.
+              (switch-to-buffer source)
+              (with-current-buffer presentation
+                (typst-canvas--on-present-window-change (selected-window)))
+              (typst-canvas-test--settle)
+              (should-not (typst-canvas--slide-info typst-canvas--session))
+              ;; Shown again: slides again.
+              (switch-to-buffer presentation)
+              (with-current-buffer presentation
+                (typst-canvas--on-present-window-change (selected-window)))
+              (set-buffer source)
+              (typst-canvas-test--settle)
+              (should (typst-canvas--slide-info typst-canvas--session))
+              ;; The window manager closes the frame of the presentation.
+              (with-current-buffer presentation
+                (setq typst-canvas--present-frame (selected-frame)))
+              (typst-canvas--on-delete-frame (selected-frame))
+              (should-not (buffer-live-p presentation))
+              (should (frame-live-p (selected-frame)))
+              (should-not typst-canvas--presentation)
+              (should-not (memq #'typst-canvas--on-delete-frame delete-frame-functions))
+              (typst-canvas-test--settle)
+              (should-not (typst-canvas--slide-info typst-canvas--session)))
+          (typst-canvas-mode -1))))))
+
 ;;;; Demo
 
 (defun typst-canvas-test--showcase ()

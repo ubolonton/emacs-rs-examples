@@ -992,7 +992,10 @@ Slides update live while the source buffer changes.
     (insert (propertize " " 'display typst-canvas--slide-canvas)))
   (goto-char (point-min))
   (add-hook 'window-size-change-functions #'typst-canvas--on-present-resize nil t)
-  (add-hook 'kill-buffer-hook #'typst-canvas--on-present-kill nil t))
+  ;; Buffer-local, it runs when a window starts or stops showing the buffer.
+  (add-hook 'window-buffer-change-functions #'typst-canvas--on-present-window-change nil t)
+  (add-hook 'kill-buffer-hook #'typst-canvas--on-present-kill nil t)
+  (add-hook 'delete-frame-functions #'typst-canvas--on-delete-frame))
 
 ;;;###autoload
 (defun typst-canvas-present ()
@@ -1057,14 +1060,16 @@ Digits, then \\[typst-canvas-present-goto]: go to that slide.
     (set-window-scroll-bars window 0 nil 0 nil)))
 
 (defun typst-canvas--slide-view ()
-  "Return [PAGE WIDTH HEIGHT] of the slide that the current presentation buffer shows."
-  (let* ((window (get-buffer-window (current-buffer) t))
-         (size (if (and window (display-graphic-p (window-frame window)))
-                   (cons (window-body-width window t) (window-body-height window t))
-                 (cons typst-canvas-default-width
-                       (round (* typst-canvas--present-aspect typst-canvas-default-width))))))
-    (setq typst-canvas--slide-size size)
-    (vector typst-canvas--slide (car size) (cdr size))))
+  "Return [PAGE WIDTH HEIGHT] of the slide that the current presentation buffer shows.
+Return nil if no window shows the buffer: then no slide is rendered."
+  (if-let* ((window (get-buffer-window (current-buffer) t)))
+      (let ((size (if (display-graphic-p (window-frame window))
+                      (cons (window-body-width window t) (window-body-height window t))
+                    (cons typst-canvas-default-width
+                          (round (* typst-canvas--present-aspect typst-canvas-default-width))))))
+        (setq typst-canvas--slide-size size)
+        (vector typst-canvas--slide (car size) (cdr size)))
+    (setq typst-canvas--slide-size nil)))
 
 (defun typst-canvas--show-slide ()
   "Copy the newest slide of the session of the current buffer into its presentation."
@@ -1145,6 +1150,31 @@ If digits were typed for `typst-canvas-present-goto', delete the last one."
                              typst-canvas--slide-size)))
         (typst-canvas--request-view)))))
 
+(defun typst-canvas--on-present-window-change (_window)
+  "Ask for slides while a window shows the presentation, and stop when none does."
+  (typst-canvas--with-guard
+    (typst-canvas--request-view)))
+
+(defun typst-canvas--presentation-buffers ()
+  "Return the live presentation buffers."
+  (seq-filter (lambda (buffer)
+                (eq (buffer-local-value 'major-mode buffer) 'typst-canvas-present-mode))
+              (buffer-list)))
+
+(defun typst-canvas--on-delete-frame (frame)
+  "End the presentations that FRAME shows, e.g. when the window manager closes it.
+They are in a frame made for them, or in a window of FRAME."
+  (typst-canvas--with-guard
+    (dolist (buffer (typst-canvas--presentation-buffers))
+      (with-current-buffer buffer
+        (when (or (eq typst-canvas--present-frame frame)
+                  (and typst-canvas--present-windows
+                       (eq (window-configuration-frame typst-canvas--present-windows) frame)))
+          ;; FRAME goes away: do not delete it again, nor restore windows into it.
+          (setq typst-canvas--present-frame nil
+                typst-canvas--present-windows nil)
+          (kill-buffer buffer))))))
+
 (defun typst-canvas--on-present-kill ()
   "Stop rendering slides, and close the presentation frame or restore the windows."
   (typst-canvas--with-guard
@@ -1157,6 +1187,8 @@ If digits were typed for `typst-canvas-present-goto', delete the last one."
             (setq typst-canvas--presentation nil)
             (when typst-canvas--session
               (typst-canvas--request nil)))))
+      (unless (cdr (typst-canvas--presentation-buffers))
+        (remove-hook 'delete-frame-functions #'typst-canvas--on-delete-frame))
       (cond
        ((and (frame-live-p frame) (cdr (frame-list)))
         (delete-frame frame))
