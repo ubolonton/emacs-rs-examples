@@ -21,7 +21,7 @@ use typst::{
 use typst_layout::{Page, PagedDocument};
 use typst_render::RenderOptions;
 
-use crate::sync::Caret;
+use crate::{STACK_SIZE, sync::Caret};
 
 /// Space around each page, in pixels. It holds the border and the shadow.
 pub const MARGIN: u32 = 16;
@@ -192,24 +192,30 @@ where
     thread::scope(|scope| {
         let render = &render;
         // Thread N renders every Nth page, so that pages of similar cost spread out.
+        let share = |thread: usize| {
+            indices
+                .iter()
+                .skip(thread)
+                .step_by(threads)
+                .map(|&index| (index, render(index)))
+                .collect::<Vec<_>>()
+        };
         let handles: Vec<_> = (0..threads)
             .map(|thread| {
-                scope.spawn(move || {
-                    indices
-                        .iter()
-                        .skip(thread)
-                        .step_by(threads)
-                        .map(|&index| (index, render(index)))
-                        .collect::<Vec<_>>()
-                })
+                let handle = thread::Builder::new()
+                    .stack_size(STACK_SIZE)
+                    .spawn_scoped(scope, move || share(thread));
+                (thread, handle)
             })
             .collect();
         handles
             .into_iter()
-            .flat_map(|handle| {
-                handle
+            .flat_map(|(thread, handle)| match handle {
+                Ok(handle) => handle
                     .join()
-                    .unwrap_or_else(|panic| panic::resume_unwind(panic))
+                    .unwrap_or_else(|panic| panic::resume_unwind(panic)),
+                // Without a thread, render its share here.
+                Err(_) => share(thread),
             })
             .collect()
     })

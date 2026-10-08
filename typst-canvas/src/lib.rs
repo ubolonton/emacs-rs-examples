@@ -28,6 +28,11 @@ use crate::{
 
 emacs::plugin_is_GPL_compatible!();
 
+/// Stack size of the threads that compile and render. Typst's layout and rendering recurse over
+/// nested content without a depth limit, and a stack overflow aborts Emacs. So give each thread as
+/// much stack as a main thread, not the default 2 MiB.
+const STACK_SIZE: usize = 8 * 1024 * 1024;
+
 #[emacs::module(
     name = "typst-canvas-dyn",
     defun_prefix = "typst-canvas",

@@ -17,6 +17,7 @@ use std::{
 use typst::{comemo, diag::Severity, layout::Point, syntax::Source};
 
 use crate::{
+    STACK_SIZE,
     math::{self, EquationImage, EquationView},
     offset,
     render::{self, PageImage, SlideView, View},
@@ -26,8 +27,6 @@ use crate::{
 
 /// Memoized results unused for this many compiles are evicted. Same as `typst watch`.
 const EVICTION_AGE: usize = 10;
-/// Layout recursion is not stack-safe, so give the thread as much stack as a main thread.
-const STACK_SIZE: usize = 8 * 1024 * 1024;
 
 #[derive(Debug, Clone)]
 pub struct Request {
