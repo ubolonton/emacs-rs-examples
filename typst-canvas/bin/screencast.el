@@ -1,9 +1,12 @@
 ;;; screencast.el --- Record typst-canvas-demo, for bin/screencast.sh -*- lexical-binding: t -*-
 
 ;; Fills the X screen with a `modus-vivendi' frame, runs `typst-canvas-demo', and records the
-;; screen with ffmpeg (x11grab) into target/screencast-raw.mkv: from the first shown pages to the
-;; end of the demo.  bin/screencast.sh encodes the MP4 and the GIF from it.  Exits with 1 if the
-;; demo or ffmpeg fails.
+;; screen with ffmpeg (x11grab): from the first shown pages to the end of the demo.  Environment:
+;; - TYPST_CANVAS_SCREENCAST: the scenario.  "demo" (default) runs the whole demo.  "inline-math"
+;;   hides the preview window, and types an equation, to show the equation below its line.
+;; - TYPST_CANVAS_SCREENCAST_OUTPUT: the lossless recording, from which bin/screencast.sh encodes
+;;   the MP4 and the GIF.
+;; Exits with 1 if the demo or ffmpeg fails.
 
 (require 'typst-canvas-demo)
 
@@ -15,8 +18,30 @@
 
 (defconst typst-canvas-screencast--frame-rate 24)
 
-(defconst typst-canvas-screencast--font-height 130
+(defconst typst-canvas-screencast--scenario (or (getenv "TYPST_CANVAS_SCREENCAST") "demo"))
+
+(defconst typst-canvas-screencast--output
+  (or (getenv "TYPST_CANVAS_SCREENCAST_OUTPUT")
+      (expand-file-name "target/screencast-raw.mkv" typst-canvas-screencast--root)))
+
+(defconst typst-canvas-screencast--font-height
+  (if (equal typst-canvas-screencast--scenario "inline-math") 160 130)
   "Height of the `default' face, in 1/10 pt.  Text must stay legible in a scaled-down GIF.")
+
+(defconst typst-canvas-screencast--inline-math-script
+  '((wait-for-preview)
+    (pause 1.2)
+    (goto "dif x $\n")
+    (type "\nEuler's identity, and a sum of binomials:\n")
+    (snippet "$ " " $\n")
+    (type "e^(i pi) + 1 = 0, quad sum_(k=0)^n binom(n, k) = 2^n")
+    (pause 1.5)
+    ;; Into the Fourier transform, then out of math.
+    (goto "hat(f)(xi)")
+    (pause 1.8)
+    (goto "Maxwell's equations")
+    (pause 1.5))
+  "Steps of the \"inline-math\" scenario.  See `typst-canvas-demo--run'.")
 
 (defconst typst-canvas-screencast--tail 1.5
   "Seconds to record after the demo ends, so that its last step shows.")
@@ -63,8 +88,7 @@ call it again after the first one."
                         ;; Lossless and cheap to encode while Emacs works.  The outputs are encoded
                         ;; from it later.
                         "-c:v" "libx264" "-preset" "ultrafast" "-qp" "0"
-                        (expand-file-name "target/screencast-raw.mkv"
-                                          typst-canvas-screencast--root)))))
+                        typst-canvas-screencast--output))))
 
 (defun typst-canvas-screencast--stop-recording ()
   "Stop ffmpeg, and exit with its status, or 1 if the demo did not finish."
@@ -85,7 +109,10 @@ call it again after the first one."
 
 (defun typst-canvas-screencast--run ()
   "Run the demo, and record it."
-  (typst-canvas-demo)
+  (if (equal typst-canvas-screencast--scenario "inline-math")
+      (let ((typst-canvas-display-action '(display-buffer-no-window (allow-no-window . t))))
+        (typst-canvas-demo typst-canvas-screencast--inline-math-script))
+    (typst-canvas-demo))
   (with-current-buffer typst-canvas-demo--buffer
     (visual-line-mode 1))
   (typst-canvas-screencast--when

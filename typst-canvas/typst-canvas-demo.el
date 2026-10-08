@@ -91,13 +91,15 @@ states compile, and the preview updates on most keys.")
   "(THEMES), with the themes that were on before the demo switched them, or nil.")
 
 ;;;###autoload
-(defun typst-canvas-demo ()
+(defun typst-canvas-demo (&optional script)
   "Show `typst-canvas-mode' on a showcase document that types itself.
 Open examples/showcase.typ in a buffer that does not visit the file,
 and type a sentence, an equation and a table row at human speed, so the
 preview updates live.  Then switch between `modus-operandi' and
 `modus-vivendi' and back, and zoom in and out.  Any command stops the
-demo.  The buffer stays, for more edits.  See `typst-canvas-demo-speed'."
+demo.  The buffer stays, for more edits.  See `typst-canvas-demo-speed'.
+
+From Lisp, SCRIPT replaces the steps.  See `typst-canvas-demo--run'."
   (interactive)
   (typst-canvas-demo-stop)
   (when-let* ((old (get-buffer typst-canvas-demo--buffer-name)))
@@ -120,7 +122,7 @@ demo.  The buffer stays, for more edits.  See `typst-canvas-demo-speed'."
     (with-current-buffer buffer
       (typst-canvas-mode 1))
     (setq typst-canvas-demo--buffer buffer
-          typst-canvas-demo--steps typst-canvas-demo--script)
+          typst-canvas-demo--steps (or script typst-canvas-demo--script))
     (add-hook 'pre-command-hook #'typst-canvas-demo-stop)
     (typst-canvas-demo--schedule 0)
     (message "typst-canvas demo: press any key to stop")))
