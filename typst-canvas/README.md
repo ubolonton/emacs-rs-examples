@@ -98,8 +98,8 @@ the redisplay that shows it. Median of 20 edits, in ms:
 
 | Edit | Total | Compile | Render | Lisp | Redisplay |
 |------|------:|--------:|-------:|-----:|----------:|
-| One char | 22 | 1.3 | 7.4 | 5.1 | 5.3 |
-| A paragraph that moves all later pages | 30 | 1.3 | 15.6 | 6.2 | 4.7 |
+| One char | 19 | 1.3 | 7.9 | 4.3 | 4.2 |
+| A paragraph that moves all later pages | 31 | 1.4 | 16.8 | 6.6 | 5.7 |
 
 The rest of the total is the timer that sends the text and the notification. With this crate at
 `opt-level` 0, the same edits took 148 and 551 ms: the per-pixel loops need optimizations, so the
@@ -126,4 +126,8 @@ EMACS=emacs-32-gtk bin/screencast.sh inline-math  # target/inline-math.mp4 and .
 - A new equation shows below its line only after its first good compile. Until then, and while an error is in it, the last image of that equation shows dimmed.
 - A presentation frame is fullscreen only if the window manager supports it. Without a window manager, as under Xvfb, Emacs sizes it itself.
 - Theme matching changes only the default colors. Documents that set their own colors keep them, and other default strokes stay black.
+- A new major mode, also from `M-x revert-buffer`, turns the mode off. A clone of the buffer starts with the mode off.
+- While the text does not compile, the caret, click jumps and diagnostics in the changed part go to the edges of that part.
+- Raw bytes (invalid UTF-8) show as U+FFFD.
+- A page image has at most 16 megapixels, and a slide at most 36 (an 8K screen). Larger pages get a smaller scale.
 - Tested only on Linux, with the GTK build.
