@@ -1,5 +1,7 @@
 # typst-canvas
 
+**This is a vibe-coded somewhat-realistic demonstration of the Rust binding of Emacs 32's module API `canvas_data`.**
+
 Live Typst preview inside Emacs 32. A Rust module compiles the buffer on a background thread and
 paints the pages into canvas images, about 25 ms after each key. No external process, no PDF
 viewer, no browser. The equation at point shows rendered below its source line, and the pages can

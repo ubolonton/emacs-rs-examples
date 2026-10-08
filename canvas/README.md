@@ -1,3 +1,5 @@
+**This is a simple vibe-coded demonstration of the Rust binding of Emacs 32's module API `canvas_data`.**
+
 Animates an Emacs 32 canvas image (Info node `(elisp) Canvas Images`) from a Rust background thread.
 
 The render thread draws into its own buffer and swaps it into a shared slot. A Lisp timer calls `canvas-demo--present`, which copies the newest frame into the canvas with `Value::with_canvas_data`, then calls `canvas-refresh`.
