@@ -347,6 +347,25 @@ Return the status."
       (kill-buffer buffer)
       (delete-file file))))
 
+(ert-deftest typst-canvas::jump-after-error-goes-to-clicked-word ()
+  (with-temp-buffer
+    (insert typst-canvas-test--jump-page "Hello world")
+    (typst-canvas-mode 1)
+    (unwind-protect
+        (let ((preview typst-canvas--preview)
+              (session typst-canvas--session))
+          (typst-canvas-test--settle)
+          ;; With an error above, the pages stay from the good text, whose positions differ.
+          (goto-char (point-min))
+          (insert "#nope\n")
+          (typst-canvas-test--settle)
+          (should (> (nth 2 typst-canvas--status) 0))
+          (with-current-buffer preview
+            (pcase-let ((`(,x . ,y) (typst-canvas-test--pixel session 0 11 15)))
+              (should (typst-canvas--jump 0 x y))))
+          (should (equal (thing-at-point 'word) "Hello")))
+      (typst-canvas-mode -1))))
+
 ;;;; Forward sync
 
 (ert-deftest typst-canvas::caret-is-drawn-on-its-page ()
@@ -478,9 +497,11 @@ Return the status."
   "A buffer text with an inline equation in its first page line.")
 
 (defun typst-canvas-test--settle ()
-  "Wait until the session of the current buffer served the newest request."
+  "Wait until the session of the current buffer served the newest text."
   (typst-canvas-test--wait
-   (lambda () (and typst-canvas--status (>= (car typst-canvas--status) typst-canvas--sent)))))
+   (lambda () (and (null typst-canvas--text-timer)
+                   typst-canvas--status
+                   (>= (car typst-canvas--status) typst-canvas--sent)))))
 
 (defun typst-canvas-test--equation-canvas ()
   "Return the canvas that the equation overlay shows, or nil."

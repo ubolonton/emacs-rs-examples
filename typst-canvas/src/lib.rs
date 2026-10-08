@@ -127,24 +127,25 @@ fn session_status<'e>(env: &'e Env, session: &Session) -> Result<Value<'e>> {
 }
 
 /// Return the diagnostics of the shown output of SESSION, as a list of
-/// (BEG END SEVERITY MESSAGE). BEG and END are buffer positions in the text of that compile.
-/// SEVERITY is `:error' or `:warning'.
+/// (BEG END SEVERITY MESSAGE). BEG and END are buffer positions in the newest text sent, mapped
+/// from the text of the compile. SEVERITY is `:error' or `:warning'.
 #[defun]
 fn session_diagnostics<'e>(env: &'e Env, session: &Session) -> Result<Value<'e>> {
-    let output = session.shown();
+    let (diagnostics, ranges) = session.diagnostics();
     let error = env.intern(":error")?;
     let warning = env.intern(":warning")?;
-    let diagnostics = output
-        .diagnostics
+    let diagnostics = diagnostics
+        .list
         .iter()
-        .map(|diagnostic| {
+        .zip(ranges)
+        .map(|(diagnostic, chars)| {
             let severity = match diagnostic.severity {
                 Severity::Error => error,
                 Severity::Warning => warning,
             };
             env.list((
-                diagnostic.chars.start + 1,
-                diagnostic.chars.end + 1,
+                chars.start + 1,
+                chars.end + 1,
                 severity,
                 diagnostic.message.as_str(),
             ))
@@ -154,7 +155,7 @@ fn session_diagnostics<'e>(env: &'e Env, session: &Session) -> Result<Value<'e>>
 }
 
 /// Return where a click at pixel X, Y of the image of page INDEX (0-based) of SESSION leads:
-/// - (source POS): position POS in the main file, in the text of the last good compile.
+/// - (source POS): position POS in the main file, in the newest text sent.
 /// - (file PATH POS): position POS in another file.
 /// - (url URL).
 /// - (position PAGE Y): pixel row Y of the image of page PAGE, e.g. for an internal link.
@@ -213,9 +214,8 @@ fn page_info<'e>(env: &'e Env, session: &Session, index: usize) -> Result<Option
         .transpose()
 }
 
-/// Move the caret of SESSION to char offset CURSOR (0-based) of the main file, or hide it if
-/// CURSOR is nil or not in laid-out text. COLOR is the caret color, as #xRRGGBB. The offset is
-/// in the text of the last good compile.
+/// Move the caret of SESSION to char offset CURSOR (0-based) of the newest text sent, or hide it
+/// if CURSOR is nil or not in laid-out text. COLOR is the caret color, as #xRRGGBB.
 ///
 /// Return (OLD NEW TOP BOTTOM). OLD and NEW are the pages of the previous and the new caret, or
 /// nil. Present them again to show the change. TOP and BOTTOM are the pixel rows of the new

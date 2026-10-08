@@ -30,7 +30,7 @@ use typst_kit::{
 };
 use typst_layout::PagedDocument;
 
-use crate::{lock, offset};
+use crate::lock;
 
 /// User agent for package downloads from Typst Universe.
 const USER_AGENT: &str = concat!("typst-canvas/", env!("CARGO_PKG_VERSION"));
@@ -59,16 +59,41 @@ pub struct PreviewWorld {
 /// A compile error or warning, located in the main file.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Diagnostic {
-    /// Character range in the main file text (0-based, like a Rust slice).
-    pub chars: Range<usize>,
+    /// Byte range in the main file text of the compile.
+    pub bytes: Range<usize>,
     pub severity: Severity,
     pub message: String,
+}
+
+/// The diagnostics of a compile, and the main file text that their ranges are in.
+#[derive(Debug, Clone)]
+pub struct Diagnostics {
+    pub source: Source,
+    pub list: Vec<Diagnostic>,
+}
+
+impl Default for Diagnostics {
+    fn default() -> Self {
+        Self {
+            source: Source::detached(String::new()),
+            list: Vec::new(),
+        }
+    }
+}
+
+impl Diagnostics {
+    pub fn count(&self, severity: Severity) -> usize {
+        self.list
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == severity)
+            .count()
+    }
 }
 
 pub struct Compiled {
     /// `None` if there were errors.
     pub document: Option<Document>,
-    pub diagnostics: Vec<Diagnostic>,
+    pub diagnostics: Diagnostics,
 }
 
 /// A compiled document, with the sources that it came from. It is a `World` that resolves the spans
@@ -164,14 +189,17 @@ impl PreviewWorld {
             ),
             Err(errors) => (None, errors),
         };
-        let diagnostics = errors
+        let list = errors
             .iter()
             .chain(&warnings)
             .map(|diagnostic| self.locate(diagnostic))
             .collect();
         Compiled {
             document,
-            diagnostics,
+            diagnostics: Diagnostics {
+                source: self.main.clone(),
+                list,
+            },
         }
     }
 
@@ -186,8 +214,8 @@ impl PreviewWorld {
             .collect()
     }
 
-    /// Convert DIAGNOSTIC into a char range in the main file. A diagnostic in another file goes
-    /// to the main-file call site that led to it, or to the start of the main file.
+    /// Locate DIAGNOSTIC in the main file. A diagnostic in another file goes to the main-file call
+    /// site that led to it, or to the start of the main file.
     fn locate(&self, diagnostic: &SourceDiagnostic) -> Diagnostic {
         let main = self.main.id();
         let in_main = |span: DiagSpan| {
@@ -213,15 +241,8 @@ impl PreviewWorld {
             message.push_str("\nhint: ");
             message.push_str(&hint.v);
         }
-        let text = self.main.text();
-        let chars = match bytes {
-            Some(bytes) => {
-                offset::byte_to_char(text, bytes.start)..offset::byte_to_char(text, bytes.end)
-            }
-            None => 0..0,
-        };
         Diagnostic {
-            chars,
+            bytes: bytes.unwrap_or_default(),
             severity: diagnostic.severity,
             message,
         }
@@ -358,7 +379,7 @@ mod tests {
     #[test]
     fn compiles_pages() -> TestResult {
         let compiled = world("A\n#pagebreak()\nB")?.compile();
-        assert_eq!(compiled.diagnostics, []);
+        assert_eq!(compiled.diagnostics.list, []);
         assert_eq!(
             compiled
                 .document
@@ -369,14 +390,16 @@ mod tests {
     }
 
     #[test]
-    fn locates_errors_in_chars() -> TestResult {
-        // "é" is 2 bytes in UTF-8, but 1 char in Emacs.
-        let compiled = world("é #nope")?.compile();
+    fn locates_errors() -> TestResult {
+        let text = "é #nope";
+        let compiled = world(text)?.compile();
         assert!(compiled.document.is_none());
-        assert_eq!(compiled.diagnostics.len(), 1, "{:?}", compiled.diagnostics);
-        let diagnostic = &compiled.diagnostics[0];
+        let list = &compiled.diagnostics.list;
+        assert_eq!(list.len(), 1, "{list:?}");
+        let diagnostic = &list[0];
         assert_eq!(diagnostic.severity, Severity::Error);
-        assert_eq!(diagnostic.chars, 3..7);
+        assert_eq!(diagnostic.bytes, find(text, "nope")?..text.len());
+        assert_eq!(compiled.diagnostics.source.text(), text);
         assert!(
             diagnostic.message.contains("unknown variable: nope"),
             "{}",
@@ -389,10 +412,11 @@ mod tests {
     fn locates_errors_in_other_files_at_main_call_site() -> TestResult {
         let text = "#import \"tests/fixtures/broken.typ\": f\n#f()";
         let compiled = world(text)?.compile();
-        assert_eq!(compiled.diagnostics.len(), 1, "{:?}", compiled.diagnostics);
-        let diagnostic = &compiled.diagnostics[0];
+        let list = &compiled.diagnostics.list;
+        assert_eq!(list.len(), 1, "{list:?}");
+        let diagnostic = &list[0];
         let call = find(text, "f()")?;
-        assert_eq!(diagnostic.chars, call..call + "f()".len());
+        assert_eq!(diagnostic.bytes, call..call + "f()".len());
         assert!(
             diagnostic
                 .message
@@ -417,7 +441,7 @@ mod tests {
         let compiled = world.compile();
         let document = compiled
             .document
-            .ok_or_else(|| format!("{:?}", compiled.diagnostics))?;
+            .ok_or_else(|| format!("{:?}", compiled.diagnostics.list))?;
         let page = &document.paged.pages()[0];
         assert_eq!(
             page.fill,

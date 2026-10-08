@@ -21,7 +21,7 @@ pub fn compile(text: &str) -> TestResult<Document> {
     let compiled = world(text)?.compile();
     Ok(compiled
         .document
-        .ok_or_else(|| format!("{:?}", compiled.diagnostics))?)
+        .ok_or_else(|| format!("{:?}", compiled.diagnostics.list))?)
 }
 
 /// Return the byte offset of the first NEEDLE in TEXT.

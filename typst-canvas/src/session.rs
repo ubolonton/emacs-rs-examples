@@ -23,10 +23,10 @@ use typst::{comemo, diag::Severity, layout::Point, syntax::Source};
 use crate::{
     STACK_SIZE, lock,
     math::{self, EquationImage, EquationView},
-    offset,
+    offset::{self, TextMap},
     render::{self, PageImage, SlideView, View},
     sync::{self, Caret, Target},
-    world::{Compiled, Diagnostic, Document, PreviewWorld, Theme},
+    world::{Compiled, Diagnostic, Diagnostics, Document, PreviewWorld, Theme},
 };
 
 /// Memoized results unused for this many compiles are evicted. Same as `typst watch`.
@@ -56,17 +56,14 @@ pub struct Output {
     /// The slide of the newest request that asked for one.
     pub slide: Option<Arc<PageImage>>,
     /// Diagnostics of the newest compile, also if it failed.
-    pub diagnostics: Arc<Vec<Diagnostic>>,
+    pub diagnostics: Arc<Diagnostics>,
     pub compile_ms: f64,
     pub render_ms: f64,
 }
 
 impl Output {
     pub fn count(&self, severity: Severity) -> usize {
-        self.diagnostics
-            .iter()
-            .filter(|diagnostic| diagnostic.severity == severity)
-            .count()
+        self.diagnostics.count(severity)
     }
 }
 
@@ -186,19 +183,33 @@ impl Session {
         Arc::clone(&lock(&self.shown))
     }
 
-    /// Return where a click at pixel X, Y of the image of page INDEX leads.
+    /// Return where a click at pixel X, Y of the image of page INDEX leads. A position in the main
+    /// file is a char offset in the newest text sent.
     pub fn jump(&self, index: usize, x: f64, y: f64) -> Option<Target> {
         let output = self.shown();
         let (document, image) = (output.document.as_ref()?, output.pages.get(index)?);
         let point = image.point_at(x, y)?;
-        sync::jump(document, index, point)
+        sync::jump(document, lock(&self.text).text(), index, point)
     }
 
-    /// Move the caret to char offset CURSOR of the main file, or hide it if CURSOR is `None` or not
-    /// in laid-out text. COLOR is the bar color, as `0xRRGGBB`. Return the page of the previous
-    /// caret, and the place of the new one.
-    ///
-    /// The offset is in the text of the last good compile.
+    /// Return the diagnostics of the shown output, and their char ranges in the newest text sent.
+    pub fn diagnostics(&self) -> (Arc<Diagnostics>, Vec<Range<usize>>) {
+        let diagnostics = Arc::clone(&self.shown().diagnostics);
+        let text = lock(&self.text);
+        let map = TextMap::new(diagnostics.source.text(), text.text());
+        let to_char = |byte| offset::byte_to_char(text.text(), map.forward(byte));
+        let ranges = diagnostics
+            .list
+            .iter()
+            .map(|diagnostic| to_char(diagnostic.bytes.start)..to_char(diagnostic.bytes.end))
+            .collect();
+        drop(text);
+        (diagnostics, ranges)
+    }
+
+    /// Move the caret to char offset CURSOR of the newest text sent, or hide it if CURSOR is `None`
+    /// or not in laid-out text. COLOR is the bar color, as `0xRRGGBB`. Return the page of the
+    /// previous caret, and the place of the new one.
     pub fn set_caret(
         &self,
         cursor: Option<usize>,
@@ -208,8 +219,13 @@ impl Session {
         let caret = cursor
             .zip(output.document.as_ref())
             .and_then(|(cursor, document)| {
-                let byte = offset::char_to_byte(document.source.text(), cursor);
-                sync::caret(document, byte)
+                // The document can be from an older text, after a failed compile.
+                let old = document.source.text();
+                let text = lock(&self.text);
+                let byte = TextMap::new(old, text.text())
+                    .backward(offset::char_to_byte(text.text(), cursor));
+                drop(text);
+                sync::caret(document, offset::floor_char_boundary(old, byte))
             });
         let place = caret.and_then(|caret| {
             let image = output.pages.get(caret.page)?;
@@ -314,11 +330,14 @@ impl Shared {
                 let mut output = lock(&self.output);
                 *output = Arc::new(Output {
                     served: id,
-                    diagnostics: Arc::new(vec![Diagnostic {
-                        chars: 0..0,
-                        severity: Severity::Error,
-                        message: "typst-canvas: The compiler panicked".into(),
-                    }]),
+                    diagnostics: Arc::new(Diagnostics {
+                        list: vec![Diagnostic {
+                            bytes: 0..0,
+                            severity: Severity::Error,
+                            message: "typst-canvas: The compiler panicked".into(),
+                        }],
+                        ..Diagnostics::default()
+                    }),
                     ..Output::clone(&output)
                 });
             }
@@ -474,7 +493,7 @@ mod tests {
         let first_pages = {
             let output = session.take_output();
             assert_eq!(output.pages.len(), 2);
-            assert_eq!(*output.diagnostics, []);
+            assert_eq!(output.diagnostics.list, []);
             // 100pt fit into 200 - 2 * MARGIN px.
             assert_eq!(output.pages[0].width, 200);
             assert_eq!(output.pages[0].height, 84 + 2 * render::MARGIN as usize);
@@ -624,7 +643,7 @@ mod tests {
             });
             wait_for(&session, &notifications, id);
             let output = session.take_output();
-            assert_eq!(*output.diagnostics, [], "{text}");
+            assert_eq!(output.diagnostics.list, [], "{text}");
             assert_eq!(output.pages.len(), 1, "{text}");
             assert!(output.slide.is_some(), "{text}");
         }
@@ -732,12 +751,63 @@ mod tests {
         assert_eq!(serve(None, theme).count(Severity::Error), 1);
         // The same theme again does not change the world, but no output has it yet.
         let output = serve(None, theme);
-        assert_eq!(*output.diagnostics, []);
+        assert_eq!(output.diagnostics.list, []);
         let image = &output.pages[0];
         assert_eq!(
             image.pixels[image.height / 2 * image.width + image.width / 2],
             0xFF00_0000
         );
+        Ok(())
+    }
+
+    #[test]
+    fn positions_map_to_newest_text() -> TestResult {
+        let (session, notifications) = start()?;
+        let serve = |text: &str| {
+            let id = session.request(Request {
+                text: Some(text.into()),
+                theme: None,
+                view: view(200),
+                slide: None,
+            });
+            wait_for(&session, &notifications, id);
+        };
+        let good = "#set page(width: 100pt, height: 100pt, margin: 10pt)\nAb\n\nCd\n\nEf";
+        serve(good);
+        let (_, before) = session.set_caret(Some(find(good, "Cd")?), 0);
+        assert!(before.is_some());
+        // With an error above, the document keeps the good text, but positions are in the newer.
+        let newer = format!("#nope\n{good}");
+        serve(&newer);
+        assert_eq!(session.shown().count(Severity::Error), 1);
+        let (_, after) = session.set_caret(Some(find(&newer, "Cd")?), 0);
+        assert_eq!(after, before);
+        let image = session.shown().pages[0].clone();
+        let (x, y) = image.pixel_at(Point::new(Abs::pt(10.5), Abs::pt(15.0)));
+        assert_eq!(
+            session.jump(0, x, y),
+            Some(Target::Main(find(&newer, "Ab")?))
+        );
+        // Diagnostics map to a text sent after their compile.
+        let (release, busy) = block_after_compile(&session);
+        let newest = format!("New\n{newer}");
+        session.request(Request {
+            text: Some(newest.clone()),
+            theme: None,
+            view: view(200),
+            slide: None,
+        });
+        busy.recv_timeout(TIMEOUT)?;
+        let (_, ranges) = session.diagnostics();
+        let nope = find(&newest, "nope")?;
+        assert_eq!(
+            ranges,
+            vec![Range {
+                start: nope,
+                end: nope + "nope".len()
+            }]
+        );
+        drop(release);
         Ok(())
     }
 

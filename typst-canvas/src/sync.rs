@@ -11,12 +11,15 @@ use typst::{
 };
 use typst_ide::Jump;
 
-use crate::{offset, world::Document};
+use crate::{
+    offset::{self, TextMap},
+    world::Document,
+};
 
 /// Where a click on a page leads.
 #[derive(Debug, Clone, PartialEq)]
 pub enum Target {
-    /// A char offset in the main file.
+    /// A char offset in the main file text that `jump` got.
     Main(usize),
     /// A char offset in another file.
     File(PathBuf, usize),
@@ -25,17 +28,20 @@ pub enum Target {
     Position(usize, Point),
 }
 
-/// Return where a click at POINT on page INDEX (0-based) of DOCUMENT leads. The document has its
-/// sources, so this needs no world, and does not wait for a compile.
-pub fn jump(document: &Document, index: usize, point: Point) -> Option<Target> {
+/// Return where a click at POINT on page INDEX (0-based) of DOCUMENT leads. A position in the main
+/// file is in TEXT, the newest text of the main file, mapped from the document's (see `TextMap`).
+///
+/// The document has its sources, so this needs no world, and does not wait for a compile.
+pub fn jump(document: &Document, text: &str, index: usize, point: Point) -> Option<Target> {
     let position = PagedPosition {
         page: NonZeroUsize::new(index + 1)?,
         point,
     };
     match typst_ide::jump_from_click(document, &document.paged, &position)? {
-        Jump::File(id, byte) if id == document.source.id() => Some(Target::Main(
-            offset::byte_to_char(document.source.text(), byte),
-        )),
+        Jump::File(id, byte) if id == document.source.id() => {
+            let map = TextMap::new(document.source.text(), text);
+            Some(Target::Main(offset::byte_to_char(text, map.forward(byte))))
+        }
         Jump::File(id, byte) => {
             let source = document.source(id).ok()?;
             Some(Target::File(
@@ -155,7 +161,7 @@ mod tests {
     use typst::layout::Abs;
 
     use super::*;
-    use crate::testing::{self, TestResult, compile};
+    use crate::testing::{self, TestResult, compile, find};
 
     const PAGE: &str = "#set page(width: 100pt, height: 100pt, margin: 10pt)\n";
 
@@ -230,11 +236,11 @@ mod tests {
         let text = format!("{PAGE}é Hello");
         let document = compile(&text)?;
         // Right after the left margin: before "é".
-        let target = jump(&document, 0, first_line(10.5));
+        let target = jump(&document, &text, 0, first_line(10.5));
         let start = text.chars().count() - "é Hello".chars().count();
         assert_eq!(target, Some(Target::Main(start)));
-        assert_eq!(jump(&document, 0, first_line(95.0)), None);
-        assert_eq!(jump(&document, 1, first_line(10.5)), None);
+        assert_eq!(jump(&document, &text, 0, first_line(95.0)), None);
+        assert_eq!(jump(&document, &text, 1, first_line(10.5)), None);
         Ok(())
     }
 
@@ -246,12 +252,14 @@ mod tests {
             .compile()
             .document
             .ok_or("the first text does not compile")?;
-        world.set_main_text(&format!("#nope\n{text}"));
+        let newer = format!("#nope\n{text}");
+        world.set_main_text(&newer);
         assert!(world.compile().document.is_none());
-        let start = text.chars().count() - "Hello".chars().count();
+        // The document's spans resolve against its own text, and the jump goes to the same word in
+        // the newer text.
         assert_eq!(
-            jump(&document, 0, first_line(10.5)),
-            Some(Target::Main(start))
+            jump(&document, &newer, 0, first_line(10.5)),
+            Some(Target::Main(find(&newer, "Hello")?))
         );
         Ok(())
     }
@@ -263,12 +271,12 @@ mod tests {
         );
         let document = compile(&text)?;
         assert_eq!(
-            jump(&document, 0, first_line(11.0)),
+            jump(&document, &text, 0, first_line(11.0)),
             Some(Target::Url("https://typst.app".into()))
         );
         assert!(
             matches!(
-                jump(&document, 0, first_line(35.0)),
+                jump(&document, &text, 0, first_line(35.0)),
                 Some(Target::Position(1, _))
             ),
             "expected a position on page 2"
@@ -285,7 +293,7 @@ mod tests {
         for round in 0..2 {
             world.set_main_text(&text);
             let document = world.compile().document.ok_or("no document")?;
-            let target = jump(&document, 0, first_line(10.5));
+            let target = jump(&document, &text, 0, first_line(10.5));
             assert!(
                 matches!(
                     &target,
