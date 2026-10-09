@@ -90,6 +90,32 @@ In a presentation (`M-x typst-canvas-present`):
 - Errors go to Flymake. The preview keeps the last good pages.
 - The equation at point is cut out of the last good layout (the frame items between its introspection tags), and rendered again at the buffer text size. So it keeps the document's `#set` and `#let` rules, and needs no extra compile. Slides are an extra image of the same compile, as large as fits the presentation window.
 
+```mermaid
+sequenceDiagram
+    participant Src as Source buffer (.typ)
+    participant Lisp as Lisp thread (defuns)
+    participant Slot as Request slot (Mutex+Condvar)
+    participant Thr as Session thread
+    participant Pipe as Pipe process
+    participant Prev as Preview buffer (canvases)
+
+    Src->>Lisp: after-change → 0-delay timer
+    Lisp->>Slot: session-request(text, theme, view)
+    Note over Slot: newer request replaces unserved one
+    Slot-->>Thr: wake
+    Thr->>Thr: compile (typst) → PagedDocument
+    Thr->>Thr: render_pages → Arc<PageImage>[]
+    Thr->>Thr: publish Arc<Output>
+    Thr->>Pipe: write "\n"
+    Pipe->>Lisp: filter → typst-canvas--on-notify
+    Lisp->>Lisp: session-status (pin shown output)
+    loop each page with a changed serial
+        Lisp->>Prev: plist-put :data-width/:data-height
+        Lisp->>Prev: present-page → with_canvas_data copy + caret
+        Lisp->>Prev: canvas-refresh
+    end
+```
+
 Details: [DESIGN.md](DESIGN.md).
 
 ## Latency
