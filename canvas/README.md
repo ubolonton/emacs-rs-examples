@@ -18,3 +18,5 @@ EMACS=emacs-32-gtk bin/screenshot.sh  # GUI run under Xvfb, saves target/screens
 (require 'canvas-demo)
 (canvas-demo)  ; Kill the buffer to stop.
 ```
+
+Prebuilt modules: download `canvas-v<version>-<target>.tar.gz` from [GitHub Releases](https://github.com/ubolonton/emacs-rs-examples/releases), and add its directory to `load-path`. The Linux module needs glibc 2.35 or later.

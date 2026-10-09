@@ -37,6 +37,8 @@ Then turn on `typst-canvas-mode` in a Typst buffer, or run `M-x typst-canvas-dem
 to stop the demo. To present the pages, run `M-x typst-canvas-present`, e.g. in
 `examples/slides.typ`.
 
+Prebuilt modules: download `typst-canvas-v<version>-<target>.tar.gz` from [GitHub Releases](https://github.com/ubolonton/emacs-rs-examples/releases), and add its directory to `load-path`. It has the Lisp code and `typst-canvas-dyn.so`. The Linux module needs glibc 2.35 and OpenSSL 3 or later.
+
 ## Keys
 
 In the preview buffer:
@@ -142,6 +144,10 @@ EMACS=emacs-32-gtk bin/screenshot.sh  # target/screenshot-{1..9}.png
 EMACS=emacs-32-gtk bin/screencast.sh  # target/screencast.mp4 and .gif
 EMACS=emacs-32-gtk bin/screencast.sh inline-math  # target/inline-math.mp4 and .gif
 ```
+
+## Releases
+
+CI (`.github/workflows/canvas.yml`) builds both packages for Linux and macOS, x86_64 and aarch64. A tag `<package>-v<version>` (e.g. `typst-canvas-v0.1.0`) publishes a release of that package. The version must match `Cargo.toml`.
 
 ## Limitations
 
