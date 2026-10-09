@@ -1,0 +1,307 @@
+//! Sync between the source and the pages: from a click on a page to the source (backward), and
+//! from the source cursor to a caret on a page (forward).
+
+use std::{num::NonZeroUsize, path::PathBuf};
+
+use typst::{
+    World,
+    introspection::PagedPosition,
+    layout::{Abs, Frame, FrameItem, Point, Transform},
+    syntax::{LinkedNode, Side, Span, SyntaxKind},
+};
+use typst_ide::Jump;
+
+use crate::{
+    offset::{self, TextMap},
+    world::Document,
+};
+
+/// Where a click on a page leads.
+#[derive(Debug, Clone, PartialEq)]
+pub enum Target {
+    /// A char offset in the main file text that `jump` got.
+    Main(usize),
+    /// A char offset in another file.
+    File(PathBuf, usize),
+    Url(String),
+    /// A point on page INDEX (0-based), e.g. the destination of an internal link.
+    Position(usize, Point),
+}
+
+/// Return where a click at POINT on page INDEX (0-based) of DOCUMENT leads. A position in the main
+/// file is in TEXT, the newest text of the main file, mapped from the document's (see `TextMap`).
+///
+/// The document has its sources, so this needs no world, and does not wait for a compile.
+pub fn jump(document: &Document, text: &str, index: usize, point: Point) -> Option<Target> {
+    let position = PagedPosition {
+        page: NonZeroUsize::new(index + 1)?,
+        point,
+    };
+    match typst_ide::jump_from_click(document, &document.paged, &position)? {
+        Jump::File(id, byte) if id == document.source.id() => {
+            let map = TextMap::new(document.source.text(), text);
+            Some(Target::Main(offset::byte_to_char(text, map.forward(byte))))
+        }
+        Jump::File(id, byte) => {
+            let source = document.source(id).ok()?;
+            Some(Target::File(
+                document.path(id)?.to_owned(),
+                offset::byte_to_char(source.text(), byte),
+            ))
+        }
+        Jump::Url(url) => Some(Target::Url(url.to_string())),
+        Jump::Position(position) => Some(Target::Position(position.page.get() - 1, position.point)),
+    }
+}
+
+/// Where the source cursor is on the pages.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct Caret {
+    /// Page index, 0-based.
+    pub page: usize,
+    /// Left edge of the caret, on the text baseline.
+    pub point: Point,
+    /// Font size of the text at the caret.
+    pub size: Abs,
+}
+
+/// Return the caret for the cursor at byte offset CURSOR in the main file of DOCUMENT, or `None`
+/// if the cursor is not in text that was laid out (e.g. it is in code or markup).
+///
+/// `typst_ide::jump_from_cursor` finds the same text node, but returns the start of the node and
+/// no font size. This walks the frames the same way, but stops at the glyph of the cursor. Math
+/// identifiers count as text: `pi` shows as a glyph with the identifier's span.
+pub fn caret(document: &Document, cursor: usize) -> Option<Caret> {
+    let is_text = |node: &LinkedNode| {
+        matches!(
+            node.kind(),
+            SyntaxKind::Text | SyntaxKind::MathText | SyntaxKind::MathIdent
+        )
+    };
+    let root = LinkedNode::new(document.source.root());
+    let node = root
+        .leaf_at(cursor, Side::Before)
+        .filter(is_text)
+        .or_else(|| root.leaf_at(cursor, Side::After).filter(is_text))?;
+    let offset = cursor.checked_sub(node.offset())?;
+    document
+        .paged
+        .pages()
+        .iter()
+        .enumerate()
+        .find_map(|(page, content)| {
+            let mut search = GlyphSearch {
+                span: node.span(),
+                offset,
+                length: node.len(),
+                before: None,
+            };
+            let (point, size) = search
+                .walk(&content.frame, Transform::identity())
+                .or(search.before.map(|(_, point, size)| (point, size)))?;
+            Some(Caret { page, point, size })
+        })
+}
+
+/// A search for the glyph at byte OFFSET in the text node SPAN, which is LENGTH bytes long.
+struct GlyphSearch {
+    span: Span,
+    offset: usize,
+    length: usize,
+    /// The node's glyph with the largest start before OFFSET: its start, the page position of its
+    /// right edge, and its font size. The caret goes there if no glyph contains OFFSET, e.g. at
+    /// the end of the node, or in spaces that collapsed into one.
+    before: Option<(usize, Point, Abs)>,
+}
+
+impl GlyphSearch {
+    /// Return the page position of the left edge of the glyph that contains the offset, and its
+    /// font size. TRANSFORM maps FRAME to the page.
+    fn walk(&mut self, frame: &Frame, transform: Transform) -> Option<(Point, Abs)> {
+        for &(position, ref item) in frame.items() {
+            match item {
+                FrameItem::Group(group) => {
+                    let inner = transform
+                        .pre_concat(Transform::translate(position.x, position.y))
+                        .pre_concat(group.transform);
+                    if let Some(found) = self.walk(&group.frame, inner) {
+                        return Some(found);
+                    }
+                }
+                FrameItem::Text(text) => {
+                    let mut x = position.x;
+                    for glyph in &text.glyphs {
+                        let advance = glyph.x_advance.at(text.size);
+                        if glyph.span.0 == self.span {
+                            let start = usize::from(glyph.span.1);
+                            // Math shapes letters as styled chars, e.g. "x" as "𝑥", and `pi` as
+                            // "π": their UTF-8 can be longer than the source.
+                            let end = (start + glyph.range().len()).min(self.length);
+                            let page = |x: Abs| Point::new(x, position.y).transform(transform);
+                            if (start..end).contains(&self.offset) {
+                                return Some((page(x), text.size));
+                            }
+                            let is_later = self.before.is_none_or(|(before, ..)| before <= start);
+                            if start < self.offset && is_later {
+                                self.before = Some((start, page(x + advance), text.size));
+                            }
+                        }
+                        x += advance;
+                    }
+                }
+                _ => {}
+            }
+        }
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use typst::layout::Abs;
+
+    use super::*;
+    use crate::testing::{self, TestResult, compile, find};
+
+    const PAGE: &str = "#set page(width: 100pt, height: 100pt, margin: 10pt)\n";
+
+    /// A point in the first line of text, at X points from the left page edge.
+    fn first_line(x: f64) -> Point {
+        Point::new(Abs::pt(x), Abs::pt(15.0))
+    }
+
+    /// Return the caret at the first occurrence of NEEDLE in TEXT, plus SHIFT bytes.
+    fn caret_at(document: &Document, text: &str, needle: &str, shift: usize) -> Option<Caret> {
+        caret(document, text.find(needle)? + shift)
+    }
+
+    #[test]
+    fn caret_follows_cursor_within_text() -> TestResult {
+        let text = format!("{PAGE}Hello world");
+        let document = compile(&text)?;
+        let start =
+            caret_at(&document, &text, "Hello", 0).ok_or("no caret at the start of the text")?;
+        assert_eq!(start.page, 0);
+        assert_eq!(start.size, Abs::pt(11.0));
+        assert!((start.point.x - Abs::pt(10.0)).abs() < Abs::pt(0.01));
+        let xs: Vec<_> = (1..="Hello world".len())
+            .filter_map(|shift| caret_at(&document, &text, "Hello", shift))
+            .map(|caret| caret.point.x)
+            .collect();
+        assert_eq!(xs.len(), "Hello world".len());
+        assert!(xs.windows(2).all(|pair| pair[0] < pair[1]), "{xs:?}");
+        assert!(xs[0] > start.point.x);
+        Ok(())
+    }
+
+    #[test]
+    fn caret_moves_past_math_letters() -> TestResult {
+        let text = format!("{PAGE}$x^2 + alpha$");
+        let document = compile(&text)?;
+        let x = |needle: &str, shift: usize| {
+            caret_at(&document, &text, needle, shift)
+                .map(|caret| caret.point.x.to_pt())
+                .ok_or(format!("no caret at {needle:?} + {shift}"))
+        };
+        // Math shapes "x" as "𝑥", whose UTF-8 is longer than the source.
+        let (before, after) = (x("x^2", 0)?, x("x^2", 1)?);
+        assert!(after > before + 3.0, "{before} {after}");
+        // Identifiers too: before their glyph while in their name, and after it at its end.
+        let (start, middle, end) = (x("alpha", 0)?, x("alpha", 3)?, x("alpha", 5)?);
+        assert!(start <= middle && middle < end, "{start} {middle} {end}");
+        Ok(())
+    }
+
+    #[test]
+    fn caret_finds_page() -> TestResult {
+        let text = format!("{PAGE}A\n#pagebreak()\nB");
+        let document = compile(&text)?;
+        assert_eq!(
+            caret_at(&document, &text, "B", 0).map(|caret| caret.page),
+            Some(1)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn caret_is_hidden_outside_text() -> TestResult {
+        let text = format!("{PAGE}Hello");
+        let document = compile(&text)?;
+        assert_eq!(caret_at(&document, &text, "page", 0), None);
+        Ok(())
+    }
+
+    #[test]
+    fn click_on_text_jumps_to_char() -> TestResult {
+        let text = format!("{PAGE}é Hello");
+        let document = compile(&text)?;
+        // Right after the left margin: before "é".
+        let target = jump(&document, &text, 0, first_line(10.5));
+        let start = text.chars().count() - "é Hello".chars().count();
+        assert_eq!(target, Some(Target::Main(start)));
+        assert_eq!(jump(&document, &text, 0, first_line(95.0)), None);
+        assert_eq!(jump(&document, &text, 1, first_line(10.5)), None);
+        Ok(())
+    }
+
+    #[test]
+    fn click_uses_text_of_document_after_failed_compile() -> TestResult {
+        let text = format!("{PAGE}Hello");
+        let mut world = testing::world(&text)?;
+        let document = world
+            .compile()
+            .document
+            .ok_or("the first text does not compile")?;
+        let newer = format!("#nope\n{text}");
+        world.set_main_text(&newer);
+        assert!(world.compile().document.is_none());
+        // The document's spans resolve against its own text, and the jump goes to the same word in
+        // the newer text.
+        assert_eq!(
+            jump(&document, &newer, 0, first_line(10.5)),
+            Some(Target::Main(find(&newer, "Hello")?))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn click_on_link_jumps_to_destination() -> TestResult {
+        let text = format!(
+            "{PAGE}#link(\"https://typst.app\")[Web] #link(<there>)[Here]\n#pagebreak()\n= There <there>"
+        );
+        let document = compile(&text)?;
+        assert_eq!(
+            jump(&document, &text, 0, first_line(11.0)),
+            Some(Target::Url("https://typst.app".into()))
+        );
+        assert!(
+            matches!(
+                jump(&document, &text, 0, first_line(35.0)),
+                Some(Target::Position(1, _))
+            ),
+            "expected a position on page 2"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn click_on_included_text_jumps_to_its_file() -> TestResult {
+        let text = format!("{PAGE}#include \"tests/fixtures/included.typ\"");
+        let mut world = testing::world(&text)?;
+        // The second compile reuses memoized results of the first. Its document must have the
+        // included source too.
+        for round in 0..2 {
+            world.set_main_text(&text);
+            let document = world.compile().document.ok_or("no document")?;
+            let target = jump(&document, &text, 0, first_line(10.5));
+            assert!(
+                matches!(
+                    &target,
+                    Some(Target::File(path, 0)) if path.ends_with("tests/fixtures/included.typ")
+                ),
+                "compile {round}: {target:?}"
+            );
+        }
+        Ok(())
+    }
+}

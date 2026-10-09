@@ -1,0 +1,12 @@
+[package]
+name = "emacs-canvas-demo"
+version = "0.1.0"
+edition = "2024"
+authors = ["Nguyễn Tuấn Anh <ubolonton@gmail.com>"]
+publish = false
+
+[dependencies]
+emacs = { version = "0.23", features = ["emacs-32-experimental"] }
+
+[lib]
+crate-type = ["cdylib"]

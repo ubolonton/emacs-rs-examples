@@ -1,0 +1,466 @@
+//! The Typst world of a preview: the buffer text is the main file, everything else comes from disk.
+
+use std::{
+    collections::HashMap,
+    error::Error,
+    fmt, mem,
+    ops::Range,
+    path::{Path, PathBuf},
+    sync::{Arc, LazyLock, Mutex},
+};
+
+use typst::{
+    Library, LibraryExt, World, WorldExt,
+    diag::{FileError, FileResult, Severity, SourceDiagnostic, Warned},
+    foundations::{Bytes, Datetime, Duration, Smart},
+    layout::{Celled, PageElem, Sides},
+    model::TableElem,
+    syntax::{DiagSpan, FileId, RootedPath, Source, VirtualPath, VirtualRoot},
+    text::{Font, FontBook, TextElem},
+    utils::LazyHash,
+    visualize::{Color, LineElem, Paint, Stroke},
+};
+use typst_ide::IdeWorld;
+use typst_kit::{
+    datetime::Time,
+    downloader::SystemDownloader,
+    files::{FileStore, FsRoot, SystemFiles},
+    fonts::{self, FontStore},
+    packages::SystemPackages,
+};
+use typst_layout::PagedDocument;
+
+use crate::lock;
+
+/// User agent for package downloads from Typst Universe.
+const USER_AGENT: &str = concat!("typst-canvas/", env!("CARGO_PKG_VERSION"));
+
+/// Fonts are shared by all sessions. The system scan takes a while, so it runs on first use, which
+/// is on a compile thread.
+static FONTS: LazyLock<FontStore> = LazyLock::new(|| {
+    let mut store = FontStore::new();
+    store.extend(fonts::system());
+    store.extend(fonts::embedded());
+    store
+});
+
+pub struct PreviewWorld {
+    /// The buffer text. It is edited in place, so that Typst can reparse incrementally.
+    main: Source,
+    library: Arc<LazyHash<Library>>,
+    theme: Option<Theme>,
+    /// Other project files and packages, loaded from disk on demand.
+    files: FileStore<SystemFiles>,
+    /// The other files that the running compile read as sources. Its document keeps them.
+    used: Mutex<HashMap<FileId, Source>>,
+    time: Time,
+}
+
+/// A compile error or warning, located in the main file.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Diagnostic {
+    /// Byte range in the main file text of the compile.
+    pub bytes: Range<usize>,
+    pub severity: Severity,
+    pub message: String,
+}
+
+/// The diagnostics of a compile, and the main file text that their ranges are in.
+#[derive(Debug, Clone)]
+pub struct Diagnostics {
+    pub source: Source,
+    pub list: Vec<Diagnostic>,
+}
+
+impl Default for Diagnostics {
+    fn default() -> Self {
+        Self {
+            source: Source::detached(String::new()),
+            list: Vec::new(),
+        }
+    }
+}
+
+impl Diagnostics {
+    pub fn count(&self, severity: Severity) -> usize {
+        self.list
+            .iter()
+            .filter(|diagnostic| diagnostic.severity == severity)
+            .count()
+    }
+}
+
+pub struct Compiled {
+    /// `None` if there were errors.
+    pub document: Option<Document>,
+    pub diagnostics: Diagnostics,
+}
+
+/// A compiled document, with the sources that it came from. It is a `World` that resolves the spans
+/// of the document against those sources: the preview world can have newer text after a failed
+/// compile, and the compile thread holds it.
+#[derive(Debug)]
+pub struct Document {
+    pub paged: PagedDocument,
+    /// The main file.
+    pub source: Source,
+    /// The other files that the compile read as sources.
+    files: HashMap<FileId, OtherFile>,
+    library: Arc<LazyHash<Library>>,
+}
+
+#[derive(Debug)]
+struct OtherFile {
+    source: Source,
+    path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+pub struct MainOutsideRoot;
+
+impl fmt::Display for MainOutsideRoot {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        formatter.write_str("the main file is not in the project root")
+    }
+}
+
+impl Error for MainOutsideRoot {}
+
+/// Default page and text colors, as `0xRRGGBB`. Documents can still set their own.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Theme {
+    pub page: u32,
+    pub text: u32,
+}
+
+impl PreviewWorld {
+    /// Create a world whose project root is ROOT, and whose main file is at MAIN.
+    ///
+    /// MAIN does not need to exist on disk. Its path only names it, and resolves relative imports.
+    pub fn new(root: &Path, main: &Path) -> Result<Self, MainOutsideRoot> {
+        let vpath = VirtualPath::virtualize(root, main).map_err(|_| MainOutsideRoot)?;
+        let id = RootedPath::new(VirtualRoot::Project, vpath).intern();
+        let packages = SystemPackages::new(SystemDownloader::new(USER_AGENT));
+        let files = SystemFiles::new(FsRoot::new(PathBuf::from(root)), packages);
+        Ok(Self {
+            main: Source::new(id, String::new()),
+            library: Arc::new(LazyHash::new(library(None))),
+            theme: None,
+            files: FileStore::new(files),
+            used: Mutex::default(),
+            time: Time::system(),
+        })
+    }
+
+    /// Replace the main file text, and mark other files as stale, so that the next compile reads
+    /// them again.
+    pub fn set_main_text(&mut self, text: &str) {
+        self.main.replace(text);
+        self.files.reset();
+        self.time = Time::system();
+    }
+
+    /// Set the default colors. Return true if they changed, and so the document must be compiled
+    /// again.
+    ///
+    /// The colors are styles of the standard library, not a `#set` rule in the source, so spans
+    /// stay valid.
+    pub fn set_theme(&mut self, theme: Option<Theme>) -> bool {
+        if self.theme == theme {
+            return false;
+        }
+        self.theme = theme;
+        self.library = Arc::new(LazyHash::new(library(theme)));
+        true
+    }
+
+    pub fn compile(&self) -> Compiled {
+        lock(&self.used).clear();
+        let Warned { output, warnings } = typst::compile::<PagedDocument>(self);
+        let (document, errors) = match output {
+            Ok(paged) => (
+                Some(Document {
+                    paged,
+                    source: self.main.clone(),
+                    files: self.used_files(),
+                    library: Arc::clone(&self.library),
+                }),
+                Default::default(),
+            ),
+            Err(errors) => (None, errors),
+        };
+        let list = errors
+            .iter()
+            .chain(&warnings)
+            .map(|diagnostic| self.locate(diagnostic))
+            .collect();
+        Compiled {
+            document,
+            diagnostics: Diagnostics {
+                source: self.main.clone(),
+                list,
+            },
+        }
+    }
+
+    /// Take the other files that the compile read as sources, and find their paths.
+    fn used_files(&self) -> HashMap<FileId, OtherFile> {
+        mem::take(&mut *lock(&self.used))
+            .into_iter()
+            .map(|(id, source)| {
+                let path = self.files.loader().resolve(id).ok();
+                (id, OtherFile { source, path })
+            })
+            .collect()
+    }
+
+    /// Locate DIAGNOSTIC in the main file. A diagnostic in another file goes to the main-file call
+    /// site that led to it, or to the start of the main file.
+    fn locate(&self, diagnostic: &SourceDiagnostic) -> Diagnostic {
+        let main = self.main.id();
+        let in_main = |span: DiagSpan| {
+            (span.id() == Some(main))
+                .then(|| self.range(span))
+                .flatten()
+        };
+        let mut message = diagnostic.message.to_string();
+        let bytes = match in_main(diagnostic.span) {
+            Some(bytes) => Some(bytes),
+            None => {
+                // The range goes to the main file, so name the file of the problem.
+                if let Some(id) = diagnostic.span.id() {
+                    message = format!("{}: {message}", id.vpath().get_without_slash());
+                }
+                diagnostic
+                    .trace
+                    .iter()
+                    .find_map(|point| in_main(point.span.into()))
+            }
+        };
+        for hint in &diagnostic.hints {
+            message.push_str("\nhint: ");
+            message.push_str(&hint.v);
+        }
+        Diagnostic {
+            bytes: bytes.unwrap_or_default(),
+            severity: diagnostic.severity,
+            message,
+        }
+    }
+}
+
+/// Return the standard library, with THEME's default colors if there is one.
+fn library(theme: Option<Theme>) -> Library {
+    let mut library = Library::default();
+    if let Some(Theme { page, text }) = theme {
+        let text = Paint::from(color(text));
+        library
+            .styles
+            .set(PageElem::fill, Smart::Custom(Some(color(page).into())));
+        library.styles.set(TextElem::fill, text.clone());
+        // Strokes default to black, which disappears on a dark page. Give the most common ones the
+        // text color.
+        let stroke = Stroke {
+            paint: Smart::Custom(text),
+            ..Stroke::default()
+        };
+        library.styles.set(LineElem::stroke, stroke.clone());
+        library.styles.set(
+            TableElem::stroke,
+            Celled::Value(Sides::splat(Some(Some(Arc::new(stroke))))),
+        );
+    }
+    library
+}
+
+fn color(rgb: u32) -> Color {
+    let [_, red, green, blue] = rgb.to_be_bytes();
+    Color::from_u8(red, green, blue, u8::MAX)
+}
+
+impl World for PreviewWorld {
+    fn library(&self) -> &LazyHash<Library> {
+        &self.library
+    }
+
+    fn book(&self) -> &LazyHash<FontBook> {
+        FONTS.book()
+    }
+
+    fn main(&self) -> FileId {
+        self.main.id()
+    }
+
+    fn source(&self, id: FileId) -> FileResult<Source> {
+        if id == self.main.id() {
+            return Ok(self.main.clone());
+        }
+        let source = self.files.source(id)?;
+        lock(&self.used).insert(id, source.clone());
+        Ok(source)
+    }
+
+    fn file(&self, id: FileId) -> FileResult<Bytes> {
+        if id == self.main.id() {
+            Ok(Bytes::from_string(self.main.clone()))
+        } else {
+            self.files.file(id)
+        }
+    }
+
+    fn font(&self, index: usize) -> Option<Font> {
+        FONTS.font(index)
+    }
+
+    fn today(&self, offset: Option<Duration>) -> Option<Datetime> {
+        self.time.today(offset)
+    }
+}
+
+impl IdeWorld for PreviewWorld {
+    fn upcast(&self) -> &dyn World {
+        self
+    }
+}
+
+impl Document {
+    /// Return the file system path of the file ID, if the compile read it as a source.
+    pub fn path(&self, id: FileId) -> Option<&Path> {
+        self.files.get(&id)?.path.as_deref()
+    }
+}
+
+impl World for Document {
+    fn library(&self) -> &LazyHash<Library> {
+        &self.library
+    }
+
+    fn book(&self) -> &LazyHash<FontBook> {
+        FONTS.book()
+    }
+
+    fn main(&self) -> FileId {
+        self.source.id()
+    }
+
+    fn source(&self, id: FileId) -> FileResult<Source> {
+        if id == self.source.id() {
+            return Ok(self.source.clone());
+        }
+        let file = self.files.get(&id).ok_or(FileError::Other(None))?;
+        Ok(file.source.clone())
+    }
+
+    fn file(&self, id: FileId) -> FileResult<Bytes> {
+        self.source(id).map(Bytes::from_string)
+    }
+
+    fn font(&self, index: usize) -> Option<Font> {
+        FONTS.font(index)
+    }
+
+    /// Jumps do not evaluate code, so they need no date.
+    fn today(&self, _offset: Option<Duration>) -> Option<Datetime> {
+        None
+    }
+}
+
+impl IdeWorld for Document {
+    fn upcast(&self) -> &dyn World {
+        self
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::testing::{TestResult, find, world};
+
+    #[test]
+    fn compiles_pages() -> TestResult {
+        let compiled = world("A\n#pagebreak()\nB")?.compile();
+        assert_eq!(compiled.diagnostics.list, []);
+        assert_eq!(
+            compiled
+                .document
+                .map(|document| document.paged.pages().len()),
+            Some(2)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn locates_errors() -> TestResult {
+        let text = "é #nope";
+        let compiled = world(text)?.compile();
+        assert!(compiled.document.is_none());
+        let list = &compiled.diagnostics.list;
+        assert_eq!(list.len(), 1, "{list:?}");
+        let diagnostic = &list[0];
+        assert_eq!(diagnostic.severity, Severity::Error);
+        assert_eq!(diagnostic.bytes, find(text, "nope")?..text.len());
+        assert_eq!(compiled.diagnostics.source.text(), text);
+        assert!(
+            diagnostic.message.contains("unknown variable: nope"),
+            "{}",
+            diagnostic.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn locates_errors_in_other_files_at_main_call_site() -> TestResult {
+        let text = "#import \"tests/fixtures/broken.typ\": f\n#f()";
+        let compiled = world(text)?.compile();
+        let list = &compiled.diagnostics.list;
+        assert_eq!(list.len(), 1, "{list:?}");
+        let diagnostic = &list[0];
+        let call = find(text, "f()")?;
+        assert_eq!(diagnostic.bytes, call..call + "f()".len());
+        assert!(
+            diagnostic
+                .message
+                .starts_with("tests/fixtures/broken.typ: unknown variable: nope"),
+            "{}",
+            diagnostic.message
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn theme_sets_default_colors() -> TestResult {
+        let mut world = world("#rect(width: 1pt, height: 1pt)")?;
+        assert!(world.set_theme(Some(Theme {
+            page: 0x10_2030,
+            text: 0xF0_E0D0,
+        })));
+        assert!(!world.set_theme(Some(Theme {
+            page: 0x10_2030,
+            text: 0xF0_E0D0,
+        })));
+        let compiled = world.compile();
+        let document = compiled
+            .document
+            .ok_or_else(|| format!("{:?}", compiled.diagnostics.list))?;
+        let page = &document.paged.pages()[0];
+        assert_eq!(
+            page.fill,
+            Smart::Custom(Some(Color::from_u8(0x10, 0x20, 0x30, 0xFF).into()))
+        );
+        assert!(world.set_theme(None));
+        let compiled = world.compile();
+        assert_eq!(
+            compiled
+                .document
+                .map(|document| document.paged.pages()[0].fill.clone()),
+            Some(Smart::Auto)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rejects_main_outside_root() {
+        let root = Path::new(env!("CARGO_MANIFEST_DIR"));
+        assert!(PreviewWorld::new(root, Path::new("/elsewhere/main.typ")).is_err());
+    }
+}
