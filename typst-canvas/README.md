@@ -19,7 +19,6 @@ an equation as it is typed (`target/inline-math.gif`).
 
 - Emacs 32 (development) built with a window system and Cairo, e.g. the GTK build. The preview needs a graphical frame.
 - Rust 1.92 or later. The first build compiles Typst, which takes a few minutes.
-- A checkout of [emacs-module-rs](https://github.com/ubolonton/emacs-module-rs) at `../../emacs-module-rs`, for its unreleased canvas binding (`emacs-32-experimental`).
 - For the scripts in `bin/`: `jq`. Under Xvfb: `xvfb-run`; for the screencast also `ffmpeg`.
 
 ## Quick start
@@ -146,7 +145,7 @@ EMACS=emacs-32-gtk bin/screencast.sh inline-math  # target/inline-math.mp4 and .
 
 ## Limitations
 
-- Needs Emacs 32, which is not released, and an unreleased emacs-module-rs feature.
+- Needs Emacs 32, which is not released.
 - Only the buffer text is live. Included files come from disk, so unsaved changes in other buffers do not show.
 - All pages are rendered, and each is kept twice (in Rust and in its canvas): about 3.5 MB per copy for an A5 page at 800 px. Long documents use much memory.
 - An edit that moves later pages re-renders all of them.

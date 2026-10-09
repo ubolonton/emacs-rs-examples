@@ -6,7 +6,6 @@ The render thread draws into its own buffer and swaps it into a shared slot. A L
 
 Requirements:
 - Emacs 32 built with a window system.
-- A checkout of [emacs-module-rs](https://github.com/ubolonton/emacs-module-rs) with the `emacs-32-experimental` feature at `../../emacs-module-rs`.
 
 ``` bash
 EMACS=emacs-32-gtk bin/test.sh        # ERT tests, batch mode

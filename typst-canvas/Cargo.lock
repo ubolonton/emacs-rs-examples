@@ -524,7 +524,9 @@ checksum = "0e9c71c2167ca323c882b99918929403426e2373ea17242ff5653e0d5e1058be"
 
 [[package]]
 name = "emacs"
-version = "0.22.0"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "5359326506f115c3817bb21452e8bc78dc8be7f911a35cb09f29de0951b9ac95"
 dependencies = [
  "anyhow",
  "ctor",
@@ -537,6 +539,8 @@ dependencies = [
 [[package]]
 name = "emacs-macros"
 version = "0.22.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "9783a9a9af46b5ed5f0e532b31cf2b76303438048f3d5fb3827651dba76a7adb"
 dependencies = [
  "darling",
  "proc-macro2",
@@ -546,7 +550,9 @@ dependencies = [
 
 [[package]]
 name = "emacs_module"
-version = "0.22.0"
+version = "0.23.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "a2bb1c8e97273fbdac0b3385d452605e775934702ee7a53d3cded4e9e77e7c1e"
 
 [[package]]
 name = "enum-ordinalize"
